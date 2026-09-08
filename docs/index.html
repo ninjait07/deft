@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deft — Windows habits for your Mac</title>
+<meta name="description" content="A free, native, open-source macOS menu-bar app: window snapping, live previews, Windows keyboard behaviour, Thai/English auto-fix, and display controls.">
+<link rel="icon" href="icon.png">
+<meta property="og:title" content="Deft — Windows habits for your Mac">
+<meta property="og:description" content="Free, native, open source. Window snapping, live previews, Windows keyboard, and more.">
+<meta property="og:image" content="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#0c0d10; --bg-2:#131519; --panel:#181b21; --line:#262a32;
+    --ink:#f2f4f7; --muted:#9aa3b0; --accent:#4a9dff; --accent-2:#6fd93b;
+    --radius:16px; --maxw:1000px;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 18px 50px rgba(0,0,0,.5);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Inter",system-ui,-apple-system,sans-serif;line-height:1.6;
+    background-image:radial-gradient(1200px 500px at 70% -10%, rgba(74,157,255,.10), transparent 60%),
+                     radial-gradient(900px 500px at 10% 0%, rgba(111,217,59,.06), transparent 55%);}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 22px}
+  h1,h2,h3{font-family:"Sora",system-ui,sans-serif;letter-spacing:-.02em;line-height:1.1;text-wrap:balance;margin:0}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  header{padding:20px 0;display:flex;align-items:center;justify-content:space-between}
+  .brand{display:flex;align-items:center;gap:12px;font-family:"Sora";font-weight:700;font-size:19px}
+  .brand img{width:34px;height:34px;border-radius:9px}
+  nav a{color:var(--muted);font-size:14px;margin-left:20px}
+  nav a:hover{color:var(--ink);text-decoration:none}
+
+  .hero{text-align:center;padding:56px 0 40px}
+  .hero img.logo{width:104px;height:104px;border-radius:24px;box-shadow:var(--shadow);margin-bottom:26px}
+  .hero h1{font-size:clamp(34px,6vw,60px);font-weight:800}
+  .hero .tag{color:var(--muted);font-size:clamp(16px,2.4vw,20px);max-width:620px;margin:18px auto 0}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:32px}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 22px;border-radius:12px;font-weight:600;
+    font-size:15px;border:1px solid var(--line);color:var(--ink);background:var(--panel)}
+  .btn.primary{background:linear-gradient(180deg,#5aa6ff,#2f7de0);border-color:#2f7de0;color:#04122b;box-shadow:var(--shadow)}
+  .btn:hover{filter:brightness(1.05);text-decoration:none}
+  .meta{color:var(--muted);font-size:13px;margin-top:14px}
+
+  section{padding:44px 0}
+  .eyebrow{color:var(--accent-2);font-weight:600;font-size:13px;letter-spacing:.1em;text-transform:uppercase}
+  h2{font-size:clamp(24px,4vw,34px);font-weight:700;margin:8px 0 26px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
+  .card h3{font-size:17px;font-weight:600;margin-bottom:6px}
+  .card p{color:var(--muted);font-size:14px;margin:0}
+  .card .ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;margin-bottom:12px;
+    background:rgba(74,157,255,.12);font-size:18px}
+
+  .split{display:grid;grid-template-columns:1.1fr 1fr;gap:28px;align-items:center}
+  @media(max-width:760px){.split{grid-template-columns:1fr}}
+  .privacy{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+  .privacy ul{margin:12px 0 0;padding-left:18px;color:var(--muted);font-size:14px}
+  .privacy li{margin:6px 0}
+  .privacy b{color:var(--ink)}
+
+  .install code{display:block;background:#0a0b0e;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13px;color:var(--accent-2);
+    overflow-x:auto}
+  ol.steps{counter-reset:s;list-style:none;padding:0;margin:0;display:grid;gap:12px}
+  ol.steps li{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px 14px 52px;
+    position:relative;color:var(--muted);font-size:14px}
+  ol.steps li::before{counter-increment:s;content:counter(s);position:absolute;left:14px;top:12px;
+    width:26px;height:26px;border-radius:8px;background:var(--accent);color:#04122b;font-weight:700;
+    display:grid;place-items:center;font-size:13px}
+  ol.steps b{color:var(--ink)}
+
+  .support{text-align:center;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:34px}
+  footer{border-top:1px solid var(--line);padding:26px 0 50px;color:var(--muted);font-size:13px;
+    display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+  .flag{display:inline-block;width:15px;height:10px;border-radius:2px;vertical-align:middle;overflow:hidden;
+    background:linear-gradient(#a51931 0 17%,#fff 17% 33%,#2d2a4a 33% 67%,#fff 67% 83%,#a51931 83%)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand"><img src="icon.png" alt="Deft"> Deft</div>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/ninjait07/deft">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <img class="logo" src="icon.png" alt="Deft app icon">
+    <h1>Windows habits, on your Mac.</h1>
+    <p class="tag">Deft is a free, native menu-bar app that brings window snapping, live previews, and Windows-style keyboard behaviour to macOS — without changing anything permanently.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/ninjait07/deft/releases/latest/download/Deft-1.0.dmg">↓ Download for macOS</a>
+      <a class="btn" href="https://github.com/ninjait07/deft">View source</a>
+    </div>
+    <div class="meta">Free &amp; open source · macOS 13+ · Apple Silicon · signed &amp; notarized</div>
+  </div>
+
+  <section id="features">
+    <div class="eyebrow">What it does</div>
+    <h2>Everything you missed from Windows</h2>
+    <div class="grid">
+      <div class="card"><div class="ic">🪟</div><h3>Windows Snap</h3><p>Drag to edges and corners to snap. Snap Layouts, Snap Assist, shared resize dividers, Aero Shake, and Win+arrow keys.</p></div>
+      <div class="card"><div class="ic">🔀</div><h3>Live Preview switcher</h3><p>Real, moving window thumbnails in Alt+Tab and Cmd+Tab, Snap Assist, and when you hover the Dock.</p></div>
+      <div class="card"><div class="ic">⌨️</div><h3>Windows keyboard</h3><p>Ctrl works as Cmd, the Win key, F-keys, Home/End, Explorer keys in Finder — with auto keyboard detection.</p></div>
+      <div class="card"><div class="ic">🇹🇭</div><h3>Auto Language Fix</h3><p>Typed “l;ylfu” instead of “สวัสดี”? Deft fixes the word and switches the input language for you.</p></div>
+      <div class="card"><div class="ic">🖱️</div><h3>Mouse &amp; scroll</h3><p>Independent natural-scroll for mouse and trackpad, side-button back/forward, and Ctrl+scroll to zoom.</p></div>
+      <div class="card"><div class="ic">📊</div><h3>System Monitor</h3><p>Live CPU, RAM, and SSD activity right in the menu bar.</p></div>
+      <div class="card"><div class="ic">🖥️</div><h3>Display controls</h3><p>Resolution, refresh rate, rotation, main display, power a display off, and drag-to-arrange displays.</p></div>
+      <div class="card"><div class="ic">🧽</div><h3>Clean Keyboard</h3><p>Lock every key, Fn, and media button so you can safely wipe the keyboard.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="split">
+      <div>
+        <div class="eyebrow">Private by design</div>
+        <h2>It stays on your Mac.</h2>
+        <p style="color:var(--muted)">Deft collects nothing, has no accounts, no ads, and no tracking. It asks only for the macOS permissions it needs — and the code is open, so you can verify exactly what it does.</p>
+      </div>
+      <div class="privacy">
+        <ul>
+          <li><b>Accessibility</b> — move and resize windows, translate shortcuts.</li>
+          <li><b>Screen Recording</b> — draw live previews. Nothing is ever recorded or sent.</li>
+          <li><b>Input Monitoring</b> — tell a Windows keyboard from a Mac one.</li>
+          <li>The only network use is checking for updates on GitHub.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" class="install">
+    <div class="eyebrow">Get started</div>
+    <h2>Install in a minute</h2>
+    <div class="split">
+      <ol class="steps">
+        <li>Download <b>Deft-1.0.dmg</b> and open it.</li>
+        <li>Drag <b>Deft</b> into your Applications folder.</li>
+        <li>Launch Deft and grant the permissions it asks for.</li>
+      </ol>
+      <div>
+        <p style="color:var(--muted);margin-top:0">Prefer Homebrew? (coming soon)</p>
+        <code>brew install --cask deft</code>
+        <p style="color:var(--muted);font-size:13px">Signed with a Developer ID and notarized by Apple, so it opens without security warnings.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="support">
+      <div class="eyebrow">Free forever</div>
+      <h2>If Deft makes your Mac feel like home</h2>
+      <p style="color:var(--muted);max-width:520px;margin:0 auto 22px">A small tip keeps it free and evolving. Thank you!</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/sponsors/ninjait07">♥ Sponsor on GitHub</a>
+        <a class="btn" href="https://github.com/ninjait07/deft">⭐ Star the repo</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div>GPL-3.0 · Crafted by Non Bannawat <span class="flag"></span></div>
+    <div><a href="https://github.com/ninjait07/deft">GitHub</a> · <a href="https://github.com/ninjait07/deft/blob/main/PRIVACY.md">Privacy</a></div>
+  </footer>
+</div>
+</body>
+</html>
