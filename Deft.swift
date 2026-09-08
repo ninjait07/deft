@@ -138,7 +138,7 @@ enum Config {
         }
         // ตำแหน่งบนเมนูบาร์ที่ระบบจำไว้จากรุ่นที่ monitor อยู่ขวาไอคอน — ล้างครั้งเดียวให้เรียงใหม่
         if !defaults.bool(forKey: "monitorLayoutV2") {
-            defaults.removeObject(forKey: "NSStatusItem Preferred Position KnackSystemMonitor")
+            defaults.removeObject(forKey: "NSStatusItem Preferred Position DeftSystemMonitor")
             defaults.set(true, forKey: "monitorLayoutV2")
         }
         // สวิตช์ System Monitor ตัวเดียวรุ่นเก่า → สวิตช์แยกตามค่า
@@ -2994,9 +2994,9 @@ enum FinderBridge {
     }
 }
 
-/// บันทึกเหตุการณ์เรื่องจอลงไฟล์ ~/Library/Logs/Knack.log — มีแค่ตอนเสียบ/ถอดจอและตอนปิดจอซ้ำ ไว้ไล่ปัญหาภายหลัง
+/// บันทึกเหตุการณ์เรื่องจอลงไฟล์ ~/Library/Logs/Deft.log — มีแค่ตอนเสียบ/ถอดจอและตอนปิดจอซ้ำ ไว้ไล่ปัญหาภายหลัง
 func knackLog(_ message: String) {
-    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Knack.log")
+    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Deft.log")
     let line = "\(Date()) \(message)\n"
     if let handle = try? FileHandle(forWritingTo: url) {
         handle.seekToEndOfFile(); handle.write(line.data(using: .utf8)!); try? handle.close()
@@ -5717,7 +5717,7 @@ final class SystemMonitor: NSObject {
     private func start() {
         if item == nil {
             let created = NSStatusBar.system.statusItem(withLength: 0)
-            created.autosaveName = "KnackSystemMonitor"
+            created.autosaveName = "DeftSystemMonitor"
             created.button?.title = ""
             created.button?.addSubview(cellsView)
             created.button?.target = self

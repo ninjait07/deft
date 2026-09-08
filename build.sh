@@ -19,9 +19,9 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="${KNACK_APP:-$HOME/Applications/Knack.app}"
-NAME="${KNACK_NAME:-Knack}"
-BUNDLE_ID="${KNACK_BUNDLE_ID:-com.nonbannawat.knack}"
+APP="${KNACK_APP:-$HOME/Applications/Deft.app}"
+NAME="${KNACK_NAME:-Deft}"
+BUNDLE_ID="${KNACK_BUNDLE_ID:-com.nonbannawat.deft}"
 VERSION="${KNACK_VERSION:-1.1}"
 BUILD="${KNACK_BUILD:-2}"
 
