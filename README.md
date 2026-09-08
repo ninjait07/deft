@@ -6,7 +6,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 
 ## Features
 
-- **Windows Snap** — drag windows to edges/corners to snap them; Snap Layouts, Snap Assist, shared resize dividers, Aero Shake, and `Win`+arrow keys.
+- **Windows Snap** — drag windows to edges/corners to snap them; Snap Layouts, Snap Assist, shared resize dividers, and `Win`+arrow keys.
 - **Live Preview** — real, moving window thumbnails in the switcher (`Alt`+`Tab` / `Cmd`+`Tab`), Snap Assist, and Dock hover.
 - **Windows keyboard** — `Ctrl` acts as `Cmd`, the `Win` key, F-keys, Home/End, Explorer keys in Finder, and auto-detection of Windows vs Mac keyboards.
 - **Auto Language Fix** — type on the wrong layout (e.g. `l;ylfu` for `สวัสดี`)? Deft fixes the word and switches the input language. Double-tap `Shift` to undo.

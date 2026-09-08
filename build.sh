@@ -22,8 +22,8 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="${KNACK_APP:-$HOME/Applications/Knack.app}"
 NAME="${KNACK_NAME:-Knack}"
 BUNDLE_ID="${KNACK_BUNDLE_ID:-com.nonbannawat.knack}"
-VERSION="${KNACK_VERSION:-1.0}"
-BUILD="${KNACK_BUILD:-1}"
+VERSION="${KNACK_VERSION:-1.1}"
+BUILD="${KNACK_BUILD:-2}"
 
 # ---- เลือก signing identity -------------------------------------------------
 pick_identity() {

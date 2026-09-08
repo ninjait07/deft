@@ -13,7 +13,6 @@
 //    • ลากขอบบน/ล่างหน้าต่างชนขอบจอ        → Vertical maximize
 //    • ดับเบิลคลิกขอบบน/ล่างหน้าต่าง        → Vertical maximize
 //    • ลากหน้าต่างที่ snap อยู่ออกมา        → คืนขนาดเดิมระหว่างลาก
-//    • เขย่า title bar                     → Aero Shake
 //    • ขอบด้านในระหว่าง 2 จอ               → มีแรงต้าน
 //    • ลากเส้นแบ่งระหว่างหน้าต่างที่ snap คู่ → ปรับขนาดพร้อมกัน
 //
@@ -73,7 +72,6 @@ enum Config {
     @StoredBool(key: "portraitTopBottom", fallback: true)  static var portraitTopBottom: Bool
     @StoredBool(key: "verticalMaximize", fallback: true)   static var verticalMaximize: Bool
     @StoredBool(key: "unsnapOnDrag", fallback: true)       static var unsnapOnDrag: Bool
-    @StoredBool(key: "aeroShake", fallback: false)         static var aeroShake: Bool
     @StoredBool(key: "snapLayouts", fallback: true)        static var snapLayouts: Bool
     @StoredBool(key: "snapAssist", fallback: true)         static var snapAssist: Bool
     @StoredBool(key: "dividers", fallback: true)           static var dividers: Bool
@@ -1790,13 +1788,6 @@ final class SnapManager {
     private var pendingTarget: SnapTarget?
     private var dwellToken = 0
 
-    // Aero Shake
-    private var shakeLastX: CGFloat = 0
-    private var shakeFlipX: CGFloat = 0
-    private var shakeDirection = 0
-    private var shakeFlips = 0
-    private var shakeFirstFlip: CFAbsoluteTime = 0
-    private var shakeMinimized: [AXUIElement] = []
 
     private struct SnapState {
         var target: SnapTarget
@@ -1904,8 +1895,6 @@ final class SnapManager {
     private func beginDrag(at point: CGPoint, clickState: Int64) {
         resetDrag()
         mouseDownAt = point
-        shakeLastX = point.x
-        shakeFlipX = point.x
 
         diag.dragsStarted += 1
         axQueue.async {
@@ -1967,7 +1956,6 @@ final class SnapManager {
         }
         switch dragMode {
         case .moving:
-            if Config.aeroShake { trackShake(at: point) }
             if Config.unsnapOnDrag { unsnapIfNeeded(window: window, point: point) }
             updateMoveTarget(at: point)
         case .resizeTop, .resizeBottom:
@@ -2128,8 +2116,6 @@ final class SnapManager {
         dragMode = .undetermined
         borderHint = .ignored
         didUnsnap = false
-        shakeFlips = 0
-        shakeDirection = 0
         activeTarget = nil
         activeScreen = nil
         pendingTarget = nil
@@ -2294,50 +2280,6 @@ final class SnapManager {
     fileprivate static func roughlyEqual(_ a: CGRect, _ b: CGRect) -> Bool {
         abs(a.minX - b.minX) < 12 && abs(a.minY - b.minY) < 12
             && abs(a.width - b.width) < 12 && abs(a.height - b.height) < 12
-    }
-
-    // MARK: Aero Shake
-
-    private func trackShake(at point: CGPoint) {
-        let delta = point.x - shakeLastX
-        shakeLastX = point.x
-        guard abs(delta) > 1 else { return }
-        let direction = delta > 0 ? 1 : -1
-        guard direction != shakeDirection else { return }
-
-        let amplitude = abs(point.x - shakeFlipX)
-        shakeDirection = direction
-        shakeFlipX = point.x
-        guard amplitude > 45 else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - shakeFirstFlip > 1.2 {
-            shakeFlips = 0
-            shakeFirstFlip = now
-        }
-        shakeFlips += 1
-        guard shakeFlips >= 3 else { return }
-        shakeFlips = 0
-        triggerShake(keeping: draggedWindow)
-    }
-
-    private func triggerShake(keeping current: AXUIElement?) {
-        overlay.dismiss()
-        let previouslyMinimized = shakeMinimized
-        shakeMinimized = []
-        axQueue.async {
-            if !previouslyMinimized.isEmpty {
-                for window in previouslyMinimized { AX.setMinimized(window, false) }
-                return
-            }
-            var minimized: [AXUIElement] = []
-            for info in WindowIndex.ordered(includeMinimized: false) {
-                if let current, CFEqual(info.element, current) { continue }
-                AX.setMinimized(info.element, true)
-                minimized.append(info.element)
-            }
-            DispatchQueue.main.async { self.shakeMinimized = minimized }
-        }
     }
 
     // MARK: Snap Assist — เลือกหน้าต่างอื่นมาเติมช่องที่เหลือ
@@ -3718,8 +3660,18 @@ final class LayoutFixer {
         if word.isEmpty { inCredentialField = Self.credentialField() }
 
         // ก้อนเดียวต้องภาษาเดียว ปนเมื่อไหร่ตัดสินไม่ได้ — เริ่มก้อนใหม่
-        if let first = word.first,
-           ThaiScript.hasThai(first.text) != ThaiScript.hasThai(text) {
+        // นับเฉพาะ "ตัวอักษร" จริง ๆ ในการเทียบสคริปต์ ส่วนเครื่องหมาย/ตัวเลข (เช่น " จาก Shift+W
+        // บนแป้นไทย) ถือเป็นกลาง อยู่ก้อนไหนก็ได้ — ไม่งั้นคำอย่าง "Windows" (ขึ้นต้นตัวใหญ่)
+        // จะโดนตัดตัวแรกทิ้งจนแปลงไม่ผ่าน
+        func letterScript(_ s: String) -> Int {   // 1 = ไทย, 2 = ละติน, 0 = เป็นกลาง
+            guard let sc = s.unicodeScalars.first else { return 0 }
+            if ThaiScript.isThai(sc) { return 1 }
+            if sc.value < 128, CharacterSet.letters.contains(sc) { return 2 }
+            return 0
+        }
+        let wordScript = word.lazy.map { letterScript($0.text) }.first { $0 != 0 }
+        let newScript = letterScript(text)
+        if let ws = wordScript, newScript != 0, ws != newScript {
             word.removeAll()
             undoneLength = 0
             inCredentialField = Self.credentialField()
@@ -3811,8 +3763,10 @@ final class LayoutFixer {
         return (converted, true)
     }
 
-    /// เรียกทุกครั้งที่พิมพ์ — ทำทีหลังให้ตัวอักษรถึงแอปก่อน จะได้ไม่หน่วงการพิมพ์
+    /// แก้สดระหว่างพิมพ์ — ปิดไว้ (แก้เฉพาะตอนเคาะเว้นวรรค/Enter เท่านั้น ไม่เด้งกลางคำ)
+    /// ถ้าอยากเปิดกลับ เอา `if true { return }` ออก
     private func liveCheck() {
+        if true { return }
         guard Config.layoutFixAuto, !busy, allowedHere, word.count >= 3 else { return }
         let strokes = word
         DispatchQueue.main.async { [weak self] in
@@ -4003,14 +3957,13 @@ enum MasterSwitch {
         switch self {
         case .windowsSnap:
             // สวิตช์เดียวรวมทุกท่า snap: ลากชนขอบ/มุม · Snap Layouts · Snap Assist · เส้นแบ่ง
-            // · ลากออก=คืนขนาด · ลากขอบ=สูงเต็มจอ · ดับเบิลคลิก=เต็มจอ · Aero Shake
+            // · ลากออก=คืนขนาด · ลากขอบ=สูงเต็มจอ · ดับเบิลคลิก=เต็มจอ
             Config.snapLayouts = value
             Config.snapAssist = value
             Config.dividers = value
             Config.unsnapOnDrag = value
             Config.verticalMaximize = value
             Config.trueMaximize = value
-            Config.aeroShake = value
             SnapManager.shared.isEnabled = value
             SnapManager.shared.refreshDividerVisibility()
         case .livePreview:
@@ -6117,7 +6070,7 @@ final class ManualWindow: NSWindow {
     private static let sections: [Section] = [
         ("Windows", "หน้าต่าง", [
             ("Windows Snap",
-             "Drag a window to a screen edge or corner to snap it to half, a quarter, or full screen. Includes Snap Layouts, Snap Assist, shared resize dividers, Aero Shake to minimise others, and Win+Arrow keys.",
+             "Drag a window to a screen edge or corner to snap it to half, a quarter, or full screen. Includes Snap Layouts, Snap Assist, shared resize dividers, and Win+Arrow keys.",
              "ลากหน้าต่างไปชนขอบหรือมุมจอเพื่อจัดเป็นครึ่งจอ เสี้ยวจอ หรือเต็มจอ มีแถบเลย์เอาต์ ตัวช่วยเลือกหน้าต่างอีกฝั่ง เส้นแบ่งปรับขนาดสองหน้าต่างพร้อมกัน เขย่าหน้าต่างเพื่อย่ออันอื่น และปุ่ม Win+ลูกศร"),
             ("Live Preview",
              "Shows real, moving thumbnails of your windows in the switcher, Snap Assist, and when hovering the Dock. Needs Screen Recording permission.",
@@ -7319,7 +7272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(separator())
         menu.addItem(header("Windows"))
         menu.addItem(toggle("Windows Snap", .windowsSnap,
-                            tip: "Edge & corner snapping · Snap Layouts · Snap Assist · shared dividers · Aero Shake · Win+arrows"))
+                            tip: "Edge & corner snapping · Snap Layouts · Snap Assist · shared dividers · Win+arrows"))
         menu.addItem(toggle("Live Preview", .livePreview,
                             tip: "Real, moving window previews in the switcher (Cmd+Tab), Snap Assist and when hovering the Dock. Needs Screen Recording"))
 
