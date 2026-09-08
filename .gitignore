@@ -1,0 +1,14 @@
+# build / release artifacts
+dist/
+build/
+*.icns
+knack-logo.png
+deft-logo.png
+
+# backups & scratch
+*.bak
+*.swift.bak
+Knack-menu.csv
+
+# macOS
+.DS_Store
