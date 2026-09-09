@@ -3883,10 +3883,12 @@ final class LayoutFixer {
     func toggleLastWord(silent: Bool = false) {
         guard Config.layoutFix else { if !silent { NSSound.beep() }; return }
 
-        // เพิ่งแก้ไปหมาด ๆ → ย้อนกลับ แล้วจำไว้ว่าอย่าไปยุ่งกับคำนี้อีก
+        // เพิ่งแปลงเสร็จสด ๆ แล้วยังไม่พิมพ์อะไรต่อ (fixTail ว่าง) → กด Shift ซ้ำ = ย้อนกลับ (toggle)
+        // แต่ถ้าพิมพ์อะไรต่อไปแล้ว ถือว่า lastFix เก่าเก็บ — ล้างทิ้ง อย่าไป revert เพราะจะลบผิดจำนวน
         if let fix = lastFix {
-            revert(fix)
-            return
+            if fixTail.isEmpty { revert(fix); return }
+            lastFix = nil
+            fixTail.removeAll()
         }
 
         // ไม่งั้นก็สลับภาษาให้คำล่าสุดเอง
@@ -3928,13 +3930,20 @@ final class LayoutFixer {
     /// ลองอ่านผ่าน AX ก่อน (สะอาดสุด ไม่แตะคลิปบอร์ด) — ใช้ได้กับช่องพิมพ์เนทีฟ
     /// ถ้า AX อ่านไม่ได้ (Electron/terminal/เว็บ) → ใช้คลิปบอร์ด: ก๊อป → แปลง → วางทับ → คืนคลิปบอร์ดเดิม
     /// ถ้าไม่มีอะไรเลือกเลย → ไปสลับคำล่าสุดที่พิมพ์ให้แทน
+    /// แปลง "เฉพาะข้อความที่คลุมดำ" เท่านั้น — ไม่มี fallback ไปแตะบัฟเฟอร์คำที่พิมพ์
+    /// (fallback แบบเก่าเคยลบยาวเกินจริงในช่องแชท/editor จนข้อความหายหมด จึงตัดทิ้ง)
     func convertSelection() {
         guard Config.layoutFix, !busy else { return }
-        if let sel = axSelectedText(), !sel.isEmpty, sel.count <= 500 {
-            if let out = converted(from: sel) { typeOver(out, toThai: !ThaiScript.hasThai(sel)) }
-            return
+        switch axSelectedText() {
+        case .some(let sel) where !sel.isEmpty:      // มีข้อความเลือกอยู่ (ผ่าน AX) → แปลงเฉพาะส่วนนั้น
+            if sel.count <= 500, let out = converted(from: sel) {
+                typeOver(out, toThai: !ThaiScript.hasThai(sel))
+            }
+        case .some:                                  // โฟกัสอยู่แต่ไม่ได้เลือกอะไร → ไม่ทำอะไร (กันลบมั่ว)
+            break
+        case .none:                                  // AX อ่านไม่ได้ (Electron/terminal/เว็บ) → ใช้ clipboard
+            convertViaClipboard()
         }
-        convertViaClipboard()
     }
 
     /// อ่านข้อความที่เลือกผ่าน Accessibility — คืน nil ถ้าแอปไม่เปิดเผยให้
@@ -3991,9 +4000,8 @@ final class LayoutFixer {
         waitForCopy(pb: pb, before: before, tries: 15) { [weak self] copied in
             guard let self else { return }
             guard let sel = copied, !sel.isEmpty, sel.count <= 500, let out = self.converted(from: sel) else {
-                self.restore(pb, saved)      // ไม่มีอะไรเลือก / แปลงไม่ได้ → คืนคลิปบอร์ด แล้วไปสลับคำล่าสุด
+                self.restore(pb, saved)      // ไม่มีอะไรเลือก / แปลงไม่ได้ → คืนคลิปบอร์ด แล้วจบ (ไม่แตะข้อความ)
                 self.busy = false
-                self.toggleLastWord(silent: true)
                 return
             }
             pb.clearContents(); pb.setString(out, forType: .string)
