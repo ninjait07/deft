@@ -102,7 +102,7 @@ enum Config {
     /// แก้คำที่พิมพ์ผิดแป้น (พิมพ์ไทยทั้งที่แป้นเป็นอังกฤษ หรือกลับกัน)
     @StoredBool(key: "layoutFix", fallback: false)           static var layoutFix: Bool
     /// แก้คำอัตโนมัติขณะพิมพ์ — ถ้าปิด ต้องสั่งแก้เองด้วยคีย์ยกเลิก/แก้คำ
-    @StoredBool(key: "layoutFixAuto", fallback: true)        static var layoutFixAuto: Bool
+    @StoredBool(key: "layoutFixAuto", fallback: false)        static var layoutFixAuto: Bool
     /// คีย์ยกเลิกการแก้คำ: 0 = แตะ Shift ×2, 1 = Esc, 2 = ใช้ได้ทั้งคู่
     @StoredNumber(key: "layoutFixUndoKey", fallback: 0)      static var layoutFixUndoKey: CGFloat
     /// Auto: ปรับพฤติกรรมปุ่มตามว่าปุ่มนั้นมาจากคีย์บอร์ด Windows หรือ Mac
@@ -3903,6 +3903,131 @@ final class LayoutFixer {
         apply(strokes: target, to: converted, toThai: toThai, trailing: trailing)
         if word.isEmpty { lastWord = [] } else { word.removeAll() }
     }
+
+    // MARK: แปลงเฉพาะส่วนที่เลือก (คลุมดำ + กด Shift 2 ครั้ง)
+
+    private static var latinToThai: [Character: Character]?
+    private static var thaiToLatin: [Character: Character]?
+    private static func buildMaps() {
+        guard latinToThai == nil, let thai = KeyLayouts.thai, let latin = KeyLayouts.latin else { return }
+        var l2t: [Character: Character] = [:], t2l: [Character: Character] = [:]
+        for code in 0..<128 {
+            for shift in [false, true] {
+                guard let ls = latin.text(code, shift: shift), let ts = thai.text(code, shift: shift),
+                      let lc = ls.count == 1 ? ls.first : nil,
+                      let tc = ts.count == 1 ? ts.first : nil else { continue }
+                if l2t[lc] == nil { l2t[lc] = tc }
+                if t2l[tc] == nil { t2l[tc] = lc }
+            }
+        }
+        latinToThai = l2t
+        thaiToLatin = t2l
+    }
+
+    /// คลุมดำ + กด Shift 2 ครั้ง → สลับแป้น (ไทย↔อังกฤษ) เฉพาะส่วนที่เลือก
+    /// ลองอ่านผ่าน AX ก่อน (สะอาดสุด ไม่แตะคลิปบอร์ด) — ใช้ได้กับช่องพิมพ์เนทีฟ
+    /// ถ้า AX อ่านไม่ได้ (Electron/terminal/เว็บ) → ใช้คลิปบอร์ด: ก๊อป → แปลง → วางทับ → คืนคลิปบอร์ดเดิม
+    /// ถ้าไม่มีอะไรเลือกเลย → ไปสลับคำล่าสุดที่พิมพ์ให้แทน
+    func convertSelection() {
+        guard Config.layoutFix, !busy else { return }
+        if let sel = axSelectedText(), !sel.isEmpty, sel.count <= 500 {
+            if let out = converted(from: sel) { typeOver(out, toThai: !ThaiScript.hasThai(sel)) }
+            return
+        }
+        convertViaClipboard()
+    }
+
+    /// อ่านข้อความที่เลือกผ่าน Accessibility — คืน nil ถ้าแอปไม่เปิดเผยให้
+    private func axSelectedText() -> String? {
+        let sys = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(sys, 0.25)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let raw = focused else { return nil }
+        var selRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(raw as! AXUIElement, kAXSelectedTextAttribute as CFString, &selRef) == .success,
+              let sel = selRef as? String else { return nil }
+        return sel
+    }
+
+    /// แปลงข้อความสลับแป้น — คืน nil ถ้าแปลงแล้วไม่เปลี่ยน (เช่นมีแต่ตัวเลข/สัญลักษณ์)
+    private func converted(from sel: String) -> String? {
+        Self.buildMaps()
+        guard let l2t = Self.latinToThai, let t2l = Self.thaiToLatin else { return nil }
+        let map = ThaiScript.hasThai(sel) ? t2l : l2t
+        let out = String(sel.map { map[$0] ?? $0 })
+        return out != sel ? out : nil
+    }
+
+    /// พิมพ์ทับ selection (แทนที่ทันที ไม่ต้องลบก่อน) แล้วสลับ input source
+    private func typeOver(_ text: String, toThai: Bool) {
+        busy = true
+        var chars = Array(text.utf16)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) else { continue }
+            e.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: &chars)
+            e.setIntegerValueField(.eventSourceUserData, value: SystemActions.syntheticTag)
+            e.post(tap: .cghidEventTap)
+        }
+        switchSource(toThai: toThai)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { self.busy = false }
+        reset()
+    }
+
+    private func switchSource(toThai: Bool) {
+        if let target = toThai ? KeyLayouts.thai?.source : KeyLayouts.latin?.source {
+            TISSelectInputSource(target)
+        }
+    }
+
+    // MARK: ทางคลิปบอร์ด — ใช้ได้ทุกแอป (VSCode, terminal, เว็บ ฯลฯ)
+
+    private func convertViaClipboard() {
+        let pb = NSPasteboard.general
+        let saved = snapshot(pb)            // เก็บคลิปบอร์ดเดิมไว้คืน (ทุกชนิด)
+        let before = pb.changeCount
+        busy = true
+        SystemActions.postKey(kVK_ANSI_C, .maskCommand)   // ก๊อปสิ่งที่เลือก
+        waitForCopy(pb: pb, before: before, tries: 15) { [weak self] copied in
+            guard let self else { return }
+            guard let sel = copied, !sel.isEmpty, sel.count <= 500, let out = self.converted(from: sel) else {
+                self.restore(pb, saved)      // ไม่มีอะไรเลือก / แปลงไม่ได้ → คืนคลิปบอร์ด แล้วไปสลับคำล่าสุด
+                self.busy = false
+                self.toggleLastWord(silent: true)
+                return
+            }
+            pb.clearContents(); pb.setString(out, forType: .string)
+            SystemActions.postKey(kVK_ANSI_V, .maskCommand)   // วางทับ
+            self.switchSource(toThai: !ThaiScript.hasThai(sel))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                self.restore(pb, saved)      // คืนคลิปบอร์ดเดิมหลังวางเสร็จ
+                self.busy = false
+                self.reset()
+            }
+        }
+    }
+
+    /// รอจน changeCount ขยับ (แปลว่าก๊อปสำเร็จ) หรือหมดเวลา (แปลว่าไม่มีอะไรเลือก)
+    private func waitForCopy(pb: NSPasteboard, before: Int, tries: Int, done: @escaping (String?) -> Void) {
+        if pb.changeCount != before { done(pb.string(forType: .string)); return }
+        guard tries > 0 else { done(nil); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            self.waitForCopy(pb: pb, before: before, tries: tries - 1, done: done)
+        }
+    }
+
+    private func snapshot(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+        (pb.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for t in item.types { if let d = item.data(forType: t) { copy.setData(d, forType: t) } }
+            return copy
+        }
+    }
+
+    private func restore(_ pb: NSPasteboard, _ items: [NSPasteboardItem]) {
+        pb.clearContents()
+        if !items.isEmpty { pb.writeObjects(items) }
+    }
 }
 
 // MARK: - รูปแบบคีย์ลัด: Windows หรือ Mac ---------------------------------------
@@ -5018,7 +5143,9 @@ final class InputTap {
         shiftDownAt = 0
         if now - shiftTapAt < 0.45 {
             shiftTapAt = 0
-            LayoutFixer.shared.toggleLastWord(silent: true)
+            DispatchQueue.main.async {
+                LayoutFixer.shared.convertSelection()
+            }
         } else {
             shiftTapAt = now
         }
@@ -6083,9 +6210,9 @@ final class ManualWindow: NSWindow {
             ("Auto-Detect Keyboard",
              "Automatically follows whichever keyboard you type on — a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring.",
              "ปรับตามคีย์บอร์ดที่คุณพิมพ์ล่าสุดอัตโนมัติ คีย์บอร์ด Windows ได้คีย์ลัดแบบ Windows คีย์บอร์ด Mac ได้แบบ Mac ต้องเปิดสิทธิ์ Input Monitoring"),
-            ("Auto Language Fix",
-             "If you type on the wrong layout (e.g. \"l;ylfu\" instead of \"สวัสดี\"), Deft fixes the word and switches the input language for you. Double-tap Shift to undo.",
-             "ถ้าพิมพ์ผิดภาษา (เช่น \"l;ylfu\" แทน \"สวัสดี\") Deft จะแก้คำและสลับภาษาให้อัตโนมัติ กด Shift สองครั้งเพื่อย้อนกลับ"),
+            ("Convert Layout",
+             "Typed on the wrong layout (e.g. \"l;ylfu\" instead of \"สวัสดี\")? Select the text and double-tap Shift — Deft converts it (Thai↔English) and switches the input language. Works in any app. With nothing selected, it converts the last word you typed.",
+             "พิมพ์ผิดแป้น (เช่น \"l;ylfu\" แทน \"สวัสดี\") ใช่ไหม? คลุมดำข้อความนั้นแล้วกด Shift สองครั้ง Deft จะแปลงให้ (ไทย↔อังกฤษ) พร้อมสลับภาษาให้ ใช้ได้ทุกแอป ถ้าไม่ได้เลือกอะไร จะแปลงคำล่าสุดที่พิมพ์ให้แทน"),
             ("Language Switch Key",
              "Pick a Windows-style key to switch the input language: ` (~), Alt+Shift, Ctrl+Shift, or Win+Space. Works while Windows Shortcuts is on.",
              "เลือกปุ่มเปลี่ยนภาษาแบบ Windows: ` (~), Alt+Shift, Ctrl+Shift หรือ Win+Space ใช้ได้ตอนเปิด Windows Shortcuts"),
@@ -7283,8 +7410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             tip: "Ctrl acts as Cmd · the Win key · F-keys · Home/End · language switch key · Explorer keys in Finder. Off = Mac shortcuts"))
         menu.addItem(toggle("Auto-Detect Keyboard", .autoKeyboard,
                             tip: "Follows whichever keyboard you type on: a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring"))
-        menu.addItem(toggle("Auto Language Fix", .layoutFix,
-                            tip: ("Typed on the wrong layout, like \"l;ylfu\" for \"สวัสดี\"? The word is fixed and the input language switched for you. Double-tap Shift to undo")))
+        menu.addItem(toggle("Convert Layout", .layoutFix,
+                            tip: ("Typed on the wrong layout, like \"l;ylfu\" for \"สวัสดี\"? Select the text and double-tap Shift to convert it (Thai↔English) and switch the input language. Nothing selected → converts the last word")))
         // แถวสวิตช์ + ลูกศรกาง แบบเดียวกับแถวจอ: สวิตช์ = เปิด/ปิดปุ่มเปลี่ยนภาษา ลูกศร = เลือกว่าปุ่มไหน
         let languageKeys: [(String, CGFloat)] = [("` (~ key)", 1), ("Alt+Shift", 2), ("Ctrl+Shift", 4), ("Win+Space", 3)]
         let languageRow = MenuSwitchExpandRow(
