@@ -129,6 +129,11 @@ enum Config {
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
     static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD }
+    /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
+    @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
+    /// เพดาน token ต่อหน้าต่าง 5 ชม. ที่ผู้ใช้ตั้งเอง (0 = อัตโนมัติจากหน้าต่างที่เคยหนักสุด)
+    @StoredNumber(key: "aiUsageLimit", fallback: 0)          static var aiUsageLimit: CGFloat
+    @StoredNumber(key: "aiUsageMaxSeen", fallback: 0)        static var aiUsageMaxSeen: CGFloat
 
     /// ย้ายค่าตั้งรุ่นเก่า: mouseScrollInvert (กลับทิศเทียบกับระบบ) → mouseNaturalScroll (ทิศที่อยากได้)
     static func migrate() {
@@ -4207,7 +4212,7 @@ enum MasterSwitch {
     case windowsSnap, livePreview
     case windowsShortcuts, autoKeyboard, layoutFix, layoutFixAuto, perAppLanguage, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
-    case monitorCPU, monitorRAM, monitorSSD
+    case monitorCPU, monitorRAM, monitorSSD, aiUsage
     case launchAtLogin
 
     var isOn: Bool {
@@ -4226,6 +4231,7 @@ enum MasterSwitch {
         case .monitorCPU:       return Config.monitorCPU
         case .monitorRAM:       return Config.monitorRAM
         case .monitorSSD:       return Config.monitorSSD
+        case .aiUsage:          return Config.aiUsage
         case .launchAtLogin:    return LoginItem.isEnabled
         }
     }
@@ -4282,6 +4288,9 @@ enum MasterSwitch {
         case .monitorSSD:
             Config.monitorSSD = value
             SystemMonitor.shared.refresh()
+        case .aiUsage:
+            Config.aiUsage = value
+            AIUsage.shared.refresh()
         case .launchAtLogin:
             Config.launchAtLogin = value
             LoginItem.set(value)
@@ -5910,6 +5919,343 @@ final class MenuActionRow: MenuRowView {
     override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
 }
 
+// MARK: - โควต้า AI: Claude Code บนเมนูบาร์ (แก้วน้ำที่ระดับขึ้นตามที่ใช้ไป) ------------
+
+/// อ่าน log ของ Claude Code ในเครื่อง (~/.claude/projects/**/*.jsonl) — ไม่ต้องผูกบัญชี ไม่ออกเน็ต
+/// นับ token ต่อข้อความของ assistant แล้วจัดเป็น "หน้าต่าง 5 ชั่วโมง" แบบเดียวกับที่ Anthropic คิดโควต้า
+/// (และแบบเดียวกับ ccusage): หน้าต่างเริ่มที่ต้นชั่วโมงของข้อความแรก ยาว 5 ชม. เว้นว่างเกิน 5 ชม. = หน้าต่างใหม่
+/// เพดานโควต้าจริงไม่มีประกาศ จึงใช้ "หน้าต่างที่เคยใช้หนักสุด" เป็น 100% (ตั้งเองได้)
+final class AIUsage {
+    static let shared = AIUsage()
+
+    struct Entry {
+        let time: Date
+        let model: String
+        let input: Int, output: Int, cacheCreate: Int, cacheRead: Int
+        var total: Int { input + output + cacheCreate + cacheRead }
+        /// ค่าใช้จ่ายโดยประมาณตามราคา API (ผู้ใช้แบบเหมาจ่ายไม่ได้จ่ายจริง แค่ให้เห็นน้ำหนัก)
+        var cost: Double {
+            let (i, o): (Double, Double)
+            if model.contains("haiku") { (i, o) = (1.0, 5.0) }
+            else if model.contains("sonnet") { (i, o) = (3.0, 15.0) }
+            else { (i, o) = (15.0, 75.0) }                       // opus / fable / ไม่รู้จัก
+            return (Double(input) * i + Double(output) * o + Double(cacheCreate) * i * 1.25
+                    + Double(cacheRead) * i * 0.1) / 1_000_000
+        }
+    }
+
+    struct Block {
+        let start: Date
+        var end: Date { start.addingTimeInterval(5 * 3600) }
+        var lastActivity: Date
+        var tokens = 0
+        var cost = 0.0
+        var isActive: Bool {
+            let now = Date()
+            return now < end && now.timeIntervalSince(lastActivity) < 5 * 3600
+        }
+    }
+
+    struct Snapshot {
+        var current: Block?
+        var limit = 0                  // token ที่ถือเป็น 100% ของหน้าต่าง
+        var maxBlock = 0               // หน้าต่างที่เคยหนักสุด (ใช้เป็นเพดานอัตโนมัติ)
+        var todayTokens = 0, todayCost = 0.0
+        var monthTokens = 0, monthCost = 0.0
+        var scanned = false
+        var fraction: Double {
+            guard let current, current.isActive, limit > 0 else { return 0 }
+            return min(1, Double(current.tokens) / Double(limit))
+        }
+    }
+    private(set) var snapshot = Snapshot()
+
+    private var entries: [Entry] = []
+    private var seen: Set<String> = []
+    private var offsets: [String: Int] = [:]          // path → byte ที่อ่านถึงแล้ว
+    private let queue = DispatchQueue(label: "deft.aiusage", qos: .utility)
+    private var timer: Timer?
+    private var item: NSStatusItem?
+    private let glass = GlassGaugeView(frame: NSRect(x: 0, y: 0, width: 26, height: 22))
+    private static let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+    private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
+    }()
+
+    func refresh() {
+        if Config.aiUsage { start() } else { stop() }
+    }
+
+    private func start() {
+        if item == nil {
+            let created = NSStatusBar.system.statusItem(withLength: 26)
+            created.autosaveName = "DeftAIUsage"
+            created.button?.title = ""
+            created.button?.addSubview(glass)
+            glass.frame = created.button?.bounds ?? glass.frame
+            glass.autoresizingMask = [.width, .height]
+            created.button?.target = self
+            created.button?.action = #selector(showDetails)
+            created.button?.sendAction(on: [.leftMouseDown])
+            created.button?.toolTip = "Claude Code quota — click for details"
+            item = created
+        }
+        guard timer == nil else { return }
+        scan()
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.scan() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func stop() {
+        timer?.invalidate(); timer = nil
+        if let item { NSStatusBar.system.removeStatusItem(item) }
+        item = nil
+    }
+
+    // MARK: อ่าน log แบบต่อท้าย (ไฟล์ jsonl มีแต่เพิ่ม ไม่แก้ของเก่า)
+
+    private func scan() {
+        queue.async { [self] in
+            guard let files = FileManager.default.enumerator(at: Self.root, includingPropertiesForKeys: [.fileSizeKey],
+                                                             options: [.skipsHiddenFiles]) else { return }
+            var fresh: [Entry] = []
+            for case let url as URL in files where url.pathExtension == "jsonl" {
+                let path = url.path
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                let from = offsets[path] ?? 0
+                guard size > from, let handle = try? FileHandle(forReadingFrom: url) else { continue }
+                defer { try? handle.close() }
+                try? handle.seek(toOffset: UInt64(from))
+                guard let data = try? handle.readToEnd() else { continue }
+                // ตัดบรรทัดสุดท้ายที่ยังเขียนไม่จบทิ้ง ไว้อ่านรอบหน้า
+                let complete = data.lastIndex(of: 0x0A).map { data.prefix(through: $0) } ?? Data()
+                offsets[path] = from + complete.count
+                guard let text = String(data: complete, encoding: .utf8) else { continue }
+                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                    guard let entry = parse(line) else { continue }
+                    fresh.append(entry)
+                }
+            }
+            guard !fresh.isEmpty || !snapshot.scanned else { return }
+            let cutoff = Date().addingTimeInterval(-40 * 86400)
+            entries.append(contentsOf: fresh)
+            entries.removeAll { $0.time < cutoff }
+            entries.sort { $0.time < $1.time }
+            let next = summarize()
+            if !snapshot.scanned { knackLog("aiusage: \(entries.count) messages · window \(next.current.map { Self.tokens($0.tokens) } ?? "-") / limit \(Self.tokens(next.limit)) · today \(Self.tokens(next.todayTokens))") }
+            DispatchQueue.main.async {
+                self.snapshot = next
+                self.glass.level = next.fraction
+                self.glass.toolTip = self.headline()
+            }
+        }
+    }
+
+    /// ดึงเฉพาะฟิลด์ที่ต้องใช้ด้วยการหาข้อความตรง ๆ — เร็วกว่าแปลง JSON ทั้งบรรทัด (บรรทัดยาวเป็น 100KB ได้)
+    private func parse(_ line: Substring) -> Entry? {
+        guard line.contains("\"type\":\"assistant\""), let usageAt = line.range(of: "\"usage\":{") else { return nil }
+        func text(_ key: String, from: Substring.Index = line.startIndex) -> String? {
+            guard let r = line.range(of: "\"\(key)\":\"", range: from..<line.endIndex) else { return nil }
+            guard let end = line[r.upperBound...].firstIndex(of: "\"") else { return nil }
+            return String(line[r.upperBound..<end])
+        }
+        func number(_ key: String) -> Int {
+            guard let r = line.range(of: "\"\(key)\":", range: usageAt.upperBound..<line.endIndex) else { return 0 }
+            var value = 0
+            for ch in line[r.upperBound...] {
+                guard let d = ch.wholeNumberValue else { break }
+                value = value * 10 + d
+            }
+            return value
+        }
+        guard let stamp = text("timestamp"),
+              let time = Self.iso.date(from: stamp) ?? Self.isoPlain.date(from: stamp) else { return nil }
+        let messageAt = line.range(of: "\"message\":{")?.upperBound ?? line.startIndex
+        let id = text("id", from: messageAt) ?? ""
+        let model = text("model", from: messageAt) ?? ""
+        guard !model.isEmpty, model != "<synthetic>" else { return nil }
+        // ข้อความเดียวกันถูกเขียนซ้ำได้หลายบรรทัดระหว่าง stream — นับครั้งเดียวตาม id
+        if !id.isEmpty { if seen.contains(id) { return nil }; seen.insert(id) }
+        return Entry(time: time, model: model, input: number("input_tokens"), output: number("output_tokens"),
+                     cacheCreate: number("cache_creation_input_tokens"), cacheRead: number("cache_read_input_tokens"))
+    }
+
+    private func summarize() -> Snapshot {
+        var s = Snapshot()
+        s.scanned = true
+        var blocks: [Block] = []
+        var current: Block?
+        let calendar = Calendar.current
+        for e in entries {
+            if var b = current, e.time < b.end, e.time.timeIntervalSince(b.lastActivity) < 5 * 3600 {
+                b.tokens += e.total; b.cost += e.cost; b.lastActivity = e.time
+                current = b
+            } else {
+                if let b = current { blocks.append(b) }
+                var start = calendar.dateComponents([.year, .month, .day, .hour], from: e.time)
+                start.minute = 0; start.second = 0
+                current = Block(start: calendar.date(from: start) ?? e.time, lastActivity: e.time, tokens: e.total, cost: e.cost)
+            }
+            if calendar.isDateInToday(e.time) { s.todayTokens += e.total; s.todayCost += e.cost }
+            if calendar.isDate(e.time, equalTo: Date(), toGranularity: .month) { s.monthTokens += e.total; s.monthCost += e.cost }
+        }
+        if let b = current { blocks.append(b) }
+        s.maxBlock = max(blocks.map(\.tokens).max() ?? 0, Int(Config.aiUsageMaxSeen))
+        if s.maxBlock > Int(Config.aiUsageMaxSeen) { Config.aiUsageMaxSeen = CGFloat(s.maxBlock) }
+        s.current = blocks.last
+        s.limit = Config.aiUsageLimit > 0 ? Int(Config.aiUsageLimit) : max(s.maxBlock, 1)
+        return s
+    }
+
+    // MARK: รายละเอียดเมื่อคลิก
+
+    static func tokens(_ n: Int) -> String {
+        n >= 1_000_000 ? String(format: "%.2fM", Double(n) / 1e6) : n >= 1000 ? String(format: "%.0fK", Double(n) / 1e3) : "\(n)"
+    }
+    private static func money(_ v: Double) -> String { String(format: "≈ $%.2f", v) }
+    private static func countdown(to date: Date) -> String {
+        let s = max(0, Int(date.timeIntervalSinceNow))
+        return s >= 3600 ? "\(s / 3600)h \((s % 3600) / 60)m" : "\(s / 60)m"
+    }
+
+    private func headline() -> String {
+        let s = snapshot
+        guard let b = s.current, b.isActive else { return "Claude Code — no active window" }
+        return "Claude Code  \(Int((s.fraction * 100).rounded()))% of window · \(Self.tokens(b.tokens)) tokens · resets in \(Self.countdown(to: b.end))"
+    }
+
+    @objc private func showDetails() {
+        let panel = MenuPanel.shared
+        if panel.isVisible || CFAbsoluteTimeGetCurrent() - panel.dismissedAt < 0.25 { panel.dismiss(); return }
+        guard let button = item?.button, let window = button.window else { return }
+        let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main ?? NSScreen.screens[0]
+        let s = snapshot
+        var rows: [MenuRowView] = []
+        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: nil))
+        if !s.scanned {
+            rows.append(MenuNoteRow("Reading usage logs…"))
+        } else if let b = s.current, b.isActive {
+            rows.append(MenuNoteRow("This window   \(Int((s.fraction * 100).rounded()))%   \(Self.tokens(b.tokens)) / \(Self.tokens(s.limit)) tokens"))
+            rows.append(MenuNoteRow("Resets in \(Self.countdown(to: b.end))   ·   \(Self.money(b.cost)) so far"))
+        } else {
+            rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
+        }
+        rows.append(MenuNoteRow("Today   \(Self.tokens(s.todayTokens)) tokens   \(Self.money(s.todayCost))"))
+        rows.append(MenuNoteRow("This month   \(Self.tokens(s.monthTokens)) tokens   \(Self.money(s.monthCost))"))
+        rows.append(MenuSeparatorRow())
+        let limitLabel = Config.aiUsageLimit > 0 ? "Limit: \(Self.tokens(Int(Config.aiUsageLimit))) (set by you)"
+                                                : "Limit: auto = heaviest window seen (\(Self.tokens(s.maxBlock)))"
+        rows.append(MenuNoteRow(limitLabel))
+        rows.append(MenuActionRow(title: "Set window limit…", symbolName: "slider.horizontal.3") { [weak self] in self?.askLimit() })
+        if Config.aiUsageLimit > 0 {
+            rows.append(MenuActionRow(title: "Back to auto limit", symbolName: "arrow.uturn.backward") { [weak self] in
+                Config.aiUsageLimit = 0; self?.scan()
+            })
+        }
+        rows.append(MenuActionRow(title: "Hide from the menu bar", symbolName: "eye.slash") {
+            MasterSwitch.aiUsage.set(false); AppDelegate.shared?.refreshMenu()
+        })
+        panel.present(rows: rows, below: anchor, on: screen)
+    }
+
+    private func askLimit() {
+        let alert = NSAlert()
+        alert.messageText = "Tokens per 5-hour window"
+        alert.informativeText = "Anthropic doesn't publish exact plan limits. Enter the number of tokens you consider 100% — e.g. 2000000 for 2M. Leave empty for auto (heaviest window seen)."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "e.g. 2000000"
+        if Config.aiUsageLimit > 0 { field.stringValue = String(Int(Config.aiUsageLimit)) }
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let digits = field.stringValue.filter(\.isNumber)
+        Config.aiUsageLimit = CGFloat(Int(digits) ?? 0)
+        scan()
+    }
+}
+
+/// แก้วน้ำบนเมนูบาร์: ระดับน้ำ = สัดส่วนโควต้าที่ใช้ไป · ผิวน้ำเป็นคลื่นขยับเบา ๆ
+/// สีน้ำ: ฟ้า → ส้ม (≥70%) → แดง (≥90%)  ·  เต็มแก้ว = หมดหน้าต่างนี้
+final class GlassGaugeView: NSView {
+    var level: Double = 0 { didSet { if abs(level - shown) > 0.002 { animating = true } } }
+    private var shown: Double = 0
+    private var phase: Double = 0
+    private var animating = false
+    private var timer: Timer?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let t = Timer(timeInterval: 1.0 / 10, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit { timer?.invalidate() }
+
+    /// ตั้งระดับทันทีไม่ต้องไล่ (ใช้ตอน export ภาพ)
+    func preview(level: Double) { shown = level; self.level = level; animating = false }
+
+    private func tick() {
+        guard window != nil, window?.occlusionState.contains(.visible) != false else { return }
+        // ไล่ระดับน้ำเข้าหาค่าจริงแบบนุ่ม ๆ (แก้วเติมขึ้นทีละนิด ไม่กระโดด)
+        if animating {
+            shown += (level - shown) * 0.15
+            if abs(level - shown) < 0.002 { shown = level; animating = false }
+        }
+        // แก้วเปล่าไม่มีอะไรให้ขยับ · มีน้ำก็ให้คลื่นไหวช้า ๆ (10 fps พอ ไม่กินเครื่อง)
+        guard shown > 0.01 || animating else { return }
+        phase += 0.35
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let inset = bounds.insetBy(dx: 5, dy: 3)
+        // ทรงแก้ว: ปากกว้าง ก้นแคบเล็กน้อย
+        let top = NSRect(x: inset.minX, y: inset.maxY, width: inset.width, height: 0)
+        let glass = NSBezierPath()
+        glass.move(to: NSPoint(x: top.minX, y: top.minY))
+        glass.line(to: NSPoint(x: inset.minX + 1.5, y: inset.minY + 1.5))
+        glass.curve(to: NSPoint(x: inset.maxX - 1.5, y: inset.minY + 1.5),
+                    controlPoint1: NSPoint(x: inset.midX - 2, y: inset.minY - 0.5),
+                    controlPoint2: NSPoint(x: inset.midX + 2, y: inset.minY - 0.5))
+        glass.line(to: NSPoint(x: top.maxX, y: top.minY))
+        glass.lineWidth = 1.3
+        let ink = NSColor.labelColor   // ตามธีมเมนูบาร์ (สว่าง/มืด) เอง
+
+        // น้ำ: ตัดขอบตามทรงแก้ว แล้ววาดคลื่นที่ผิว
+        NSGraphicsContext.saveGraphicsState()
+        glass.addClip()
+        let waterHeight = inset.height * CGFloat(min(1, max(0, shown)))
+        if waterHeight > 0.5 {
+            let surface = inset.minY + waterHeight
+            let water = NSBezierPath()
+            water.move(to: NSPoint(x: inset.minX - 2, y: inset.minY - 2))
+            water.line(to: NSPoint(x: inset.minX - 2, y: surface))
+            let amp: CGFloat = shown >= 0.995 ? 0 : 0.9
+            var x = inset.minX - 2
+            while x <= inset.maxX + 2 {
+                let y = surface + sin(Double(x) * 0.9 + phase) * amp
+                water.line(to: NSPoint(x: x, y: y)); x += 1
+            }
+            water.line(to: NSPoint(x: inset.maxX + 2, y: inset.minY - 2))
+            water.close()
+            let color: NSColor = shown >= 0.9 ? .systemRed : shown >= 0.7 ? .systemOrange : .systemBlue
+            color.withAlphaComponent(0.85).setFill()
+            water.fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        ink.withAlphaComponent(0.9).setStroke()
+        glass.stroke()
+    }
+}
+
 // MARK: - แถบสถานะระบบ: CPU · RAM · SSD บนเมนูบาร์ ------------------------------
 
 /// ช่องละค่า ความกว้างคงที่ — ตัวเลขเปลี่ยนแล้วช่องไม่ขยับ พื้นช่องเติมสีตาม % ให้เห็นระดับได้ทันที
@@ -6399,6 +6745,11 @@ final class ManualWindow: NSWindow {
             ("Clean Keyboard",
              "Locks every key, Fn, and media button so you can wipe the keyboard safely. Turn it off from the menu or the floating Unlock button.",
              "ล็อกทุกปุ่ม รวมปุ่ม Fn และปุ่มมีเดีย เพื่อเช็ดทำความสะอาดคีย์บอร์ด ปิดได้จากเมนูหรือปุ่ม Unlock ที่ลอยอยู่"),
+        ]),
+        ("AI Usage", "โควต้า AI", [
+            ("Claude Code Quota",
+             "Shows a glass of water on the menu bar that fills up as you use your 5-hour Claude Code window (blue → orange → red). It reads Claude Code's own logs on this Mac, so there is no account to link and nothing is sent anywhere. Click the glass for tokens used, an approximate cost at API prices, time until the window resets, and today's / this month's totals. Anthropic doesn't publish exact plan limits, so 100% is the heaviest window you've ever used — or set your own limit.",
+             "แสดงแก้วน้ำบนเมนูบาร์ที่ค่อย ๆ เต็มตามการใช้งาน Claude Code ในหน้าต่าง 5 ชั่วโมง (ฟ้า → ส้ม → แดง) อ่านจาก log ของ Claude Code ในเครื่องนี้เอง ไม่ต้องผูกบัญชีและไม่มีอะไรถูกส่งออกไป คลิกที่แก้วเพื่อดู token ที่ใช้ ค่าใช้จ่ายโดยประมาณตามราคา API เวลาที่เหลือก่อนรีเซ็ต และยอดรวมวันนี้/เดือนนี้ Anthropic ไม่ประกาศเพดานที่แน่นอน จึงถือหน้าต่างที่เคยใช้หนักสุดเป็น 100% หรือตั้งเพดานเองก็ได้"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",
@@ -7412,6 +7763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         buildStatusItem()
         SystemMonitor.shared.refresh()   // สร้างหลังไอคอน Deft เพื่อให้ไปอยู่ทางซ้ายของไอคอน
+        AIUsage.shared.refresh()
         startWhenTrusted()
     }
 
@@ -7539,7 +7891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// หัวข้อกลุ่มในเมนู — ตัวเล็กสีจาง คั่นของให้อ่านเป็นกลุ่มได้
     private static let sectionIcons: [String: String] = [
         "Windows": "macwindow", "Keyboard": "keyboard", "Mouse": "computermouse",
-        "System Monitor": "chart.bar.xaxis", "Display": "display", "System": "gearshape"]
+        "System Monitor": "chart.bar.xaxis", "AI Usage": "sparkles", "Display": "display", "System": "gearshape"]
     private func header(_ text: String, badge: String? = nil) -> MenuRowView {
         MenuHeaderLabelRow(symbol: Self.sectionIcons[text] ?? "circle", text: text, badge: badge)
     }
@@ -7648,6 +8000,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             tip: "Memory used (app + wired + compressed), as Activity Monitor counts it"))
         menu.addItem(toggle("SSD", .monitorSSD,
                             tip: "Disk activity (share of time busy reading/writing, as iostat measures it). Click for speed and capacity"))
+
+        // ---- AI Usage ------------------------------------------------------
+        menu.addItem(separator())
+        menu.addItem(header("AI Usage"))
+        menu.addItem(toggle("Claude Code Quota", .aiUsage,
+                            tip: "A glass on the menu bar fills up as you use your 5-hour Claude Code window. Read from Claude Code's own logs on this Mac — nothing leaves your computer. Click the glass for tokens, cost and reset time"))
 
         // ---- Display -------------------------------------------------------
         menu.addItem(separator())
@@ -8264,6 +8622,30 @@ let app = NSApplication.shared
 if let flag = CommandLine.arguments.firstIndex(of: "--export-icon") {
     let target = CommandLine.arguments.count > flag + 1 ? CommandLine.arguments[flag + 1] : "."
     Brand.exportIconSet(to: URL(fileURLWithPath: target))
+    exit(0)
+}
+
+// เรนเดอร์แก้วโควต้าที่ระดับต่าง ๆ เป็น PNG ไว้ดูหน้าตา (ใช้ตอนพัฒนา):  Deft --export-gauge out.png
+if let flag = CommandLine.arguments.firstIndex(of: "--export-gauge") {
+    let target = CommandLine.arguments.count > flag + 1 ? CommandLine.arguments[flag + 1] : "gauge.png"
+    let levels: [Double] = [0, 0.2, 0.5, 0.75, 0.95, 1.0]
+    let scale: CGFloat = 4, cell = NSSize(width: 26, height: 22)
+    let image = NSImage(size: NSSize(width: cell.width * CGFloat(levels.count) * scale, height: cell.height * scale))
+    image.lockFocus()
+    NSColor(white: 0.12, alpha: 1).setFill(); NSRect(origin: .zero, size: image.size).fill()
+    NSGraphicsContext.current?.cgContext.scaleBy(x: scale, y: scale)
+    for (i, level) in levels.enumerated() {
+        let view = GlassGaugeView(frame: NSRect(x: 0, y: 0, width: cell.width, height: cell.height))
+        view.preview(level: level)
+        NSGraphicsContext.current?.cgContext.saveGState()
+        NSGraphicsContext.current?.cgContext.translateBy(x: CGFloat(i) * cell.width, y: 0)
+        view.draw(view.bounds)
+        NSGraphicsContext.current?.cgContext.restoreGState()
+    }
+    image.unlockFocus()
+    if let tiff = image.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+        try? png.write(to: URL(fileURLWithPath: target))
+    }
     exit(0)
 }
 
