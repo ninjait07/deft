@@ -6342,7 +6342,43 @@ final class MonitorCellsView: NSView {
         color.setStroke()
         path.stroke()
     }
-    var cells: [Cell] = [] { didSet { needsDisplay = true } }
+    var cells: [Cell] = [] { didSet { retarget() } }
+
+    // แอนิเมชัน: แถบ/ตัวเลขไหลเข้าหาค่าใหม่แทนกระโดดทุก 2 วิ · ช่องที่วิกฤต (≥85%) หายใจเตือนเบา ๆ
+    // timer วาดเดินเฉพาะตอนมีอะไรขยับ พอนิ่งแล้วหยุดเอง — ไม่กินเครื่องตอนไม่มีอะไรเปลี่ยน
+    private var shown: [Double] = []          // ค่าที่วาดอยู่ (ค่อย ๆ ไล่เข้าหา cells[i].percent)
+    private var phase = 0.0
+    private var animator: Timer?
+
+    private func retarget() {
+        if shown.count != cells.count { shown = cells.map { Double($0.percent) } }
+        needsDisplay = true
+        wake()
+    }
+
+    private var needsMotion: Bool {
+        for (i, c) in cells.enumerated() where abs(shown[i] - Double(c.percent)) > 0.15 || c.percent >= 85 { return true }
+        return false
+    }
+
+    private func wake() {
+        guard animator == nil, needsMotion else { return }
+        let t = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.step() }
+        RunLoop.main.add(t, forMode: .common)
+        animator = t
+    }
+
+    private func step() {
+        guard window?.occlusionState.contains(.visible) != false else { return }
+        phase += 0.09
+        for (i, c) in cells.enumerated() {
+            let target = Double(c.percent)
+            shown[i] += (target - shown[i]) * 0.18
+            if abs(target - shown[i]) < 0.15 { shown[i] = target }
+        }
+        needsDisplay = true
+        if !needsMotion { animator?.invalidate(); animator = nil }
+    }
 
     static let cellWidth: CGFloat = 60   // ไอคอน + "100%" ไม่ชนกัน
     static let cellHeight: CGFloat = 18
@@ -6383,14 +6419,17 @@ final class MonitorCellsView: NSView {
             shape.fill()
 
             // แถบสัดส่วนเติมจากซ้ายตาม % — สีเปลี่ยนตามระดับ
-            let level = max(0, min(100, cell.percent))
+            let smooth = max(0, min(100, index < shown.count ? shown[index] : Double(cell.percent)))
+            let level = Int(smooth.rounded())
             let isClaude = cell.symbol == "claude"
             let tint: NSColor = level >= 85 ? .systemRed : level >= 70 ? .systemOrange : (isClaude ? Self.claudeBrand : Skin.accent)
+            // วิกฤต = แถบหายใจ (ความทึบแกว่ง 0.22–0.42 ช้า ๆ)
+            let breath = level >= 85 ? 0.32 + 0.10 * sin(phase) : 0.28
             NSGraphicsContext.saveGraphicsState()
             shape.addClip()
-            tint.withAlphaComponent(0.28).setFill()
+            tint.withAlphaComponent(breath).setFill()
             NSRect(x: rect.minX, y: rect.minY,
-                   width: rect.width * CGFloat(level) / 100, height: rect.height).fill()
+                   width: rect.width * CGFloat(smooth) / 100, height: rect.height).fill()
             NSGraphicsContext.restoreGraphicsState()
 
             // ไอคอนซ้าย ตัวเลขขวา — ตัวเลขชิดขวาเสมอ ช่องจึงไม่ขยับ
