@@ -102,7 +102,9 @@ enum Config {
     /// แก้คำที่พิมพ์ผิดแป้น (พิมพ์ไทยทั้งที่แป้นเป็นอังกฤษ หรือกลับกัน)
     @StoredBool(key: "layoutFix", fallback: false)           static var layoutFix: Bool
     /// แก้คำอัตโนมัติขณะพิมพ์ — ถ้าปิด ต้องสั่งแก้เองด้วยคีย์ยกเลิก/แก้คำ
-    @StoredBool(key: "layoutFixAuto", fallback: false)        static var layoutFixAuto: Bool
+    @StoredBool(key: "layoutFixAuto", fallback: true)         static var layoutFixAuto: Bool
+    /// จำภาษาที่ใช้ล่าสุดของแต่ละแอป แล้วสลับให้เองตอนสลับแอป (แบบ Windows ที่ภาษาเป็นของแต่ละหน้าต่าง)
+    @StoredBool(key: "perAppLanguage", fallback: true)       static var perAppLanguage: Bool
     /// คีย์ยกเลิกการแก้คำ: 0 = แตะ Shift ×2, 1 = Esc, 2 = ใช้ได้ทั้งคู่
     @StoredNumber(key: "layoutFixUndoKey", fallback: 0)      static var layoutFixUndoKey: CGFloat
     /// Auto: ปรับพฤติกรรมปุ่มตามว่าปุ่มนั้นมาจากคีย์บอร์ด Windows หรือ Mac
@@ -1860,6 +1862,8 @@ final class SnapManager {
         let location = event.location
         switch type {
         case .leftMouseDown:
+            // คลิก = เคอร์เซอร์พิมพ์ย้ายที่ — คำที่ Convert Layout กำลังตามอยู่ไม่ตรงกับหน้าจอแล้ว ล้างทิ้ง
+            LayoutFixer.shared.reset()
             // คลิกที่ตกลงบนหน้าต่างหรือไอคอนเมนูบาร์ของ Deft เอง ต้องไม่เริ่มลาก:
             // ถ้าปล่อยให้ axQueue ยิง AXUIElementCopyElementAtPosition ใส่ตัวเอง HIServices จะตอบ
             // ในโปรเซสเดียวกันบนเธรดนั้นทันที ไปชนกับ AppKit ที่กำลังกางเมนูบน main thread
@@ -2902,6 +2906,7 @@ enum FrontApp {
         ) { note in
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             bundleID = app?.bundleIdentifier ?? ""
+            LanguageMemory.appActivated(bundleID)
         }
     }
 }
@@ -2968,6 +2973,50 @@ enum LanguageSwitcher {
 }
 
 // MARK: - คุยกับ Finder --------------------------------------------------------
+
+// MARK: - จำภาษาต่อแอป (แบบ Windows: ภาษาเป็นของแต่ละหน้าต่าง) -----------------------
+
+/// LINE เป็นไทย · Terminal เป็นอังกฤษ · สลับแอปเมื่อไหร่ภาษากลับมาเป็นอย่างที่เคยใช้ในแอปนั้น
+/// ไม่ต้องตั้งค่าอะไร — จำจากที่ผู้ใช้สลับเองครั้งล่าสุดในแอปนั้น
+enum LanguageMemory {
+    private static var memory: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "perAppLanguageMemory") as? [String: String] ?? [:]
+    private static var applying = false
+
+    private static var currentSourceID: String? {
+        guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(current, kTISPropertyInputSourceID) else { return nil }
+        return Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue() as? String
+    }
+
+    static func start() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil, queue: .main
+        ) { _ in
+            // การสลับที่เราสั่งเองตอนเปลี่ยนแอป ไม่ใช่ความตั้งใจของผู้ใช้ — ไม่จำ
+            guard !applying, Config.perAppLanguage, let id = currentSourceID else { return }
+            let app = FrontApp.bundleID
+            guard !app.isEmpty, app != Bundle.main.bundleIdentifier else { return }
+            if memory[app] != id {
+                memory[app] = id
+                UserDefaults.standard.set(memory, forKey: "perAppLanguageMemory")
+            }
+        }
+    }
+
+    /// เรียกตอนแอปหน้าสุดเปลี่ยน — คืนภาษาที่แอปนั้นเคยใช้
+    static func appActivated(_ bundleID: String) {
+        guard Config.perAppLanguage, let wanted = memory[bundleID], wanted != currentSourceID else { return }
+        let filter = [kTISPropertyInputSourceID: wanted] as CFDictionary
+        guard let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource],
+              let source = list.first else { return }
+        applying = true
+        TISSelectInputSource(source)
+        LayoutFixer.shared.languageSwitched()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { applying = false }
+    }
+}
 
 enum FinderBridge {
     /// ตัดไฟล์ค้างอยู่หรือเปล่า (Ctrl+X แล้วรอ Ctrl+V)
@@ -3510,6 +3559,103 @@ enum ThaiScript {
     }
 }
 
+// MARK: - โมเดลสถิติตัวอักษร: "ข้อความนี้หน้าตาเป็นไทย/อังกฤษไหม" -----------------
+
+/// trigram ของตัวอักษรไทยและอังกฤษ สร้างจากคลังคำ (tools/build-langmodel.py → Resources/LangModel.bin)
+/// ใช้ตัดสินว่าสิ่งที่พิมพ์ "เป็นไปได้ในภาษานี้ไหม" โดยไม่ต้องพึ่งพจนานุกรม — ชื่อคน ศัพท์แปลก
+/// คำแชท ก็ตัดสินได้ เพราะดูแค่ลำดับตัวอักษร (l; ไม่มีทางเกิดในอังกฤษ · ำแ ไม่มีทางเกิดในไทย)
+final class LangModel {
+    static let shared = LangModel()
+
+    private struct Table {
+        var total: Float = 0
+        var uni: [UInt16: Float] = [:]
+        var bi: [UInt32: Float] = [:]
+        var tri: [UInt64: Float] = [:]
+        var ctx1: [UInt16: Float] = [:]     // ผลรวมของ bigram ที่ขึ้นต้นด้วยตัวนี้
+        var ctx2: [UInt32: Float] = [:]     // ผลรวมของ trigram ที่ขึ้นต้นด้วยคู่นี้
+        var vocab: Float = 0
+    }
+    private var thai = Table()
+    private var english = Table()
+    private(set) var isLoaded = false
+    private static let bound: UInt16 = 1
+    private static let smoothing: Float = 1.0
+
+    private init() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            guard let url = Bundle.main.url(forResource: "LangModel", withExtension: "bin"),
+                  let data = try? Data(contentsOf: url) else { knackLog("langmodel: missing"); return }
+            var offset = 6
+            guard data.count > offset, data[0] == 0x44, data[1] == 0x46 else { return }   // "DF"
+            var tables: [UInt8: Table] = [:]
+            for _ in 0..<2 {
+                guard let (tag, table) = Self.readTable(data, &offset) else { return }
+                tables[tag] = table
+            }
+            guard let t = tables[UInt8(ascii: "t")], let e = tables[UInt8(ascii: "e")] else { return }
+            DispatchQueue.main.async { self.thai = t; self.english = e; self.isLoaded = true }
+        }
+    }
+
+    private static func readTable(_ d: Data, _ o: inout Int) -> (UInt8, Table)? {
+        func u8() -> UInt8 { defer { o += 1 }; return d[o] }
+        func u16() -> UInt16 { defer { o += 2 }; return UInt16(d[o]) | UInt16(d[o + 1]) << 8 }
+        func u32() -> UInt32 { defer { o += 4 }; return (0..<4).reduce(UInt32(0)) { $0 | UInt32(d[o + $1]) << (8 * UInt32($1)) } }
+        func u64() -> UInt64 { defer { o += 8 }; return (0..<8).reduce(UInt64(0)) { $0 | UInt64(d[o + $1]) << (8 * UInt64($1)) } }
+        func f32() -> Float { Float(bitPattern: u32()) }
+        guard o + 5 <= d.count else { return nil }
+        let tag = u8()
+        var t = Table()
+        t.total = f32()
+        let nUni = Int(u32()); for _ in 0..<nUni { let k = u16(); t.uni[k] = f32() }
+        let nBi = Int(u32()); for _ in 0..<nBi { let k = u32(); let w = f32(); t.bi[k] = w; t.ctx1[UInt16(k >> 16), default: 0] += w }
+        let nTri = Int(u32()); for _ in 0..<nTri { let k = u64(); let w = f32(); t.tri[k] = w; t.ctx2[UInt32(k >> 16), default: 0] += w }
+        t.vocab = Float(nUni + 4)
+        return (tag, t)
+    }
+
+    private static func thaiCodes(_ s: String) -> [UInt16] {
+        s.unicodeScalars.map { ThaiScript.isThai($0) ? UInt16($0.value) : 0 }
+    }
+    private static func englishCodes(_ s: String) -> [UInt16] {
+        s.lowercased().unicodeScalars.map { ($0.value >= 97 && $0.value <= 122) || $0.value == 39 ? UInt16($0.value) : 0 }
+    }
+
+    /// log-ความน่าจะเป็นเฉลี่ยต่อตัวอักษร (สูง = หน้าตาเหมือนภาษานี้)  ·  partial = ยังพิมพ์ไม่จบคำ ไม่นับขอบท้าย
+    private func score(_ t: Table, _ codes: [UInt16], partial: Bool) -> Double {
+        let k = Self.smoothing
+        func p1(_ c: UInt16) -> Float { ((t.uni[c] ?? 0) + 1) / (t.total + t.vocab) }
+        func p2(_ b: UInt16, _ c: UInt16) -> Float {
+            ((t.bi[UInt32(b) << 16 | UInt32(c)] ?? 0) + k * p1(c)) / ((t.ctx1[b] ?? 0) + k)
+        }
+        func p3(_ a: UInt16, _ b: UInt16, _ c: UInt16) -> Float {
+            ((t.tri[UInt64(a) << 32 | UInt64(b) << 16 | UInt64(c)] ?? 0) + k * p2(b, c))
+                / ((t.ctx2[UInt32(a) << 16 | UInt32(b)] ?? 0) + k)
+        }
+        var seq = [Self.bound, Self.bound] + codes
+        if !partial { seq.append(Self.bound) }
+        guard seq.count > 2 else { return -99 }
+        var sum = 0.0
+        for i in 2..<seq.count { sum += Double(log(p3(seq[i - 2], seq[i - 1], seq[i]))) }
+        return sum / Double(seq.count - 2)
+    }
+
+    func scoreThai(_ s: String, partial: Bool) -> Double { score(thai, Self.thaiCodes(s), partial: partial) }
+    func scoreEnglish(_ s: String, partial: Bool) -> Double { score(english, Self.englishCodes(s), partial: partial) }
+
+    /// ควรแปลงไหม: ให้คะแนน "ที่พิมพ์" ในภาษาของแป้นปัจจุบัน เทียบกับ "ที่แปลงแล้ว" ในอีกภาษา
+    /// เกณฑ์วัดจากคำจริง 9,000 คำ: ตอนจบคำ margin 1.0 แปลงถูก 95–98% ไม่แปลงคำจริงผิด 99.9%
+    /// ระหว่างพิมพ์ (partial) margin 2.0 ไม่เคยเผลอแปลง prefix ของคำจริงเลย (0.00%)
+    func shouldConvert(typed: String, converted: String, typedIsThai: Bool, partial: Bool) -> Bool {
+        guard isLoaded else { return false }
+        let current = typedIsThai ? scoreThai(typed, partial: partial) : scoreEnglish(typed, partial: partial)
+        let other = typedIsThai ? scoreEnglish(converted, partial: partial) : scoreThai(converted, partial: partial)
+        let margin = partial ? 2.0 : 1.0
+        return other - current > margin && other > -6
+    }
+}
+
 // MARK: - แก้คำที่พิมพ์ผิดภาษา ---------------------------------------------------
 
 final class LayoutFixer {
@@ -3536,8 +3682,14 @@ final class LayoutFixer {
     /// ตัวอักษร (รวมเว้นวรรค) ที่พิมพ์ต่อหลังการแก้ล่าสุด — ไว้ถอยกลับไปยกเลิก
     /// การแก้นั้นได้แม้พิมพ์เลยไปไกลแล้ว: ลบหาง+คำที่แก้ แล้วพิมพ์คำเดิม+หางคืน
     private var fixTail: [String] = []
-    /// คำที่ผู้ใช้สั่งย้อนกลับแล้ว — อย่าไปแก้ซ้ำอีกในรอบนี้
-    private var ignored: Set<String> = []
+    /// คำที่ผู้ใช้สั่งย้อนกลับแล้ว — อย่าไปแก้อีก (จำถาวร)
+    private var ignored: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "layoutFixIgnored") ?? []) {
+        didSet { UserDefaults.standard.set(Array(ignored.suffix(500)), forKey: "layoutFixIgnored") }
+    }
+    /// คำที่ผู้ใช้สั่งแปลงเองแล้ว — ครั้งหน้าแปลงให้ทันทีไม่ต้องคิด (จำถาวร)
+    private var learned: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "layoutFixLearned") ?? []) {
+        didSet { UserDefaults.standard.set(Array(learned.suffix(500)), forKey: "layoutFixLearned") }
+    }
     /// ความยาวของคำที่เพิ่งย้อนไป — ต้องพิมพ์ต่ออีกอย่างน้อย 2 ตัวถึงจะยอมแก้ใหม่
     /// ไม่งั้นพอกด Esc แล้วพิมพ์ต่อตัวเดียวมันจะเด้งกลับไปแก้ทันที เหมือนแย่งกัน
     private var undoneLength = 0
@@ -3725,79 +3877,43 @@ final class LayoutFixer {
         return range.location == NSNotFound
     }
 
-    /// ยังมีคำอังกฤษที่ขึ้นต้นแบบนี้เหลืออยู่ไหม — ใช้ตัดสินตั้งแต่ยังพิมพ์ไม่จบคำ
-    /// "sna" ยังมีทาง (snap, snack) แต่ "l;y" ไม่มีคำไหนเป็นไปได้แล้ว
-    private static func hasEnglishCompletions(_ prefix: String) -> Bool {
-        guard prefix.allSatisfy({ $0.isASCII && $0.isLetter }) else { return false }
-        let range = NSRange(location: 0, length: prefix.utf16.count)
-        let list = NSSpellChecker.shared.completions(forPartialWordRange: range, in: prefix,
-                                                     language: "en", inSpellDocumentWithTag: 0)
-        return !(list ?? []).isEmpty
-    }
-
-    /// ตัดสินตั้งแต่ยังพิมพ์อยู่ ไม่ต้องรอเว้นวรรคหรือ Enter
-    /// ยิงเร็วไม่เป็นไร เพราะพอแก้แล้วเราสลับแป้นให้ด้วย ตัวที่พิมพ์ต่อจึงออกมาถูกเอง
-    private func liveCorrection(for strokes: [Stroke]) -> (text: String, toThai: Bool)? {
+    /// ตัดสินด้วยโมเดลสถิติตัวอักษร (LangModel) — ใช้ทั้งตอนกำลังพิมพ์ (partial) และตอนจบคำ
+    /// ลำดับการตัดสิน: คำที่ผู้ใช้เคยย้อน → ไม่แตะ · คำที่ผู้ใช้เคยสั่งแปลง → แปลงเลย ·
+    /// คำอังกฤษจริงบนแป้นอังกฤษ → ไม่แตะ · ที่เหลือให้โมเดลเทียบว่าแปลงแล้ว "หน้าตาเป็นภาษา" มากขึ้นชัดเจนไหม
+    private func modelCorrection(for strokes: [Stroke], partial: Bool) -> (text: String, toThai: Bool)? {
         guard let thai = KeyLayouts.thai, let latin = KeyLayouts.latin else { return nil }
         let typed = strokes.map(\.text).joined()
-        guard !ignored.contains(typed) else { return nil }
-        guard undoneLength == 0 || typed.count >= undoneLength + 2 else {
-            return nil }
-
-        if ThaiScript.hasThai(typed) {
-            // แป้นเป็นไทยอยู่ แต่แปลงกลับแล้วกลายเป็นคำอังกฤษเต็มคำ
-            let english = render(strokes, with: latin)
-            guard english.count >= 3, Self.isEnglishWord(english) else {
-                return nil }
-            return (english, false)
-        }
-        // แป้นเป็นอังกฤษ แต่ไม่มีคำอังกฤษคำไหนขึ้นต้นแบบนี้ได้แล้ว
-        guard typed.count >= 3 else { return nil }
-        guard !Self.hasEnglishCompletions(typed) else {
-            return nil }
-        let converted = render(strokes, with: thai)
-        guard converted.unicodeScalars.allSatisfy(ThaiScript.isThai) else {
-            return nil }
-        guard ThaiScript.wellFormed(converted) else {
-            return nil }
-        return (converted, true)
+        // นับเป็น scalar ไม่ใช่ตัวอักษรที่มองเห็น — สระ/วรรณยุกต์ไทยจะรวมกลุ่มกับพยัญชนะ ("ะ้ำ" นับได้ 2)
+        let length = typed.unicodeScalars.count
+        guard length >= 3, !ignored.contains(typed) else { return nil }
+        guard undoneLength == 0 || length >= undoneLength + 2 else { return nil }
+        let typedIsThai = ThaiScript.hasThai(typed)
+        let converted = render(strokes, with: typedIsThai ? latin : thai)
+        guard converted != typed else { return nil }
+        if learned.contains(typed) { return (converted, !typedIsThai) }
+        if !typedIsThai, !partial, Self.isEnglishWord(typed) { return nil }
+        guard LangModel.shared.shouldConvert(typed: typed, converted: converted,
+                                             typedIsThai: typedIsThai, partial: partial) else { return nil }
+        return (converted, !typedIsThai)
     }
 
-    /// แก้สดระหว่างพิมพ์ — ปิดไว้ (แก้เฉพาะตอนเคาะเว้นวรรค/Enter เท่านั้น ไม่เด้งกลางคำ)
-    /// ถ้าอยากเปิดกลับ เอา `if true { return }` ออก
+    /// แก้สดระหว่างพิมพ์ — โมเดลมั่นใจตั้งแต่ตัวที่ 3 (l;y ไม่มีทางเป็นอังกฤษ) ก็แก้เลย ไม่ต้องรอเว้นวรรค
+    /// พอแก้แล้วสลับแป้นให้ด้วย ตัวที่พิมพ์ต่อจึงออกมาถูกเอง
     private func liveCheck() {
-        if true { return }
         guard Config.layoutFixAuto, !busy, allowedHere, word.count >= 3 else { return }
         let strokes = word
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.busy, self.word.count == strokes.count,
-                  let fix = self.liveCorrection(for: strokes) else { return }
+                  let fix = self.modelCorrection(for: strokes, partial: true) else { return }
             self.word.removeAll()
             self.lastWord = strokes
             self.apply(strokes: strokes, to: fix.text, toThai: fix.toThai, trailing: 0)
         }
     }
 
-    /// คืนข้อความที่ควรจะเป็น ถ้ามั่นใจพอว่าพิมพ์ผิดแป้น
+    /// คืนข้อความที่ควรจะเป็น ถ้ามั่นใจพอว่าพิมพ์ผิดแป้น (ตัดสินทั้งคำ ตอนเคาะเว้นวรรค/Enter)
     private func correction(for strokes: [Stroke]) -> (text: String, toThai: Bool)? {
-        guard let thai = KeyLayouts.thai, let latin = KeyLayouts.latin else { return nil }
-        let typed = strokes.map(\.text).joined()
-        guard typed.count >= 2, !ignored.contains(typed) else { return nil }
-
-        if ThaiScript.hasThai(typed) {
-            // พิมพ์อังกฤษทั้งที่แป้นเป็นไทย — เกณฑ์คือแปลงกลับแล้วต้องเป็นคำอังกฤษจริง
-            // วัดกับคำไทยที่ใช้บ่อย 96 คำแล้วไม่มีคำไหนโดนแก้ผิดเลย
-            let english = render(strokes, with: latin)
-            guard english.count >= 3, Self.isEnglishWord(english) else { return nil }
-            return (english, false)
-        } else {
-            // พิมพ์ไทยทั้งที่แป้นเป็นอังกฤษ → ต้องไม่ใช่คำอังกฤษ และไทยที่แปลงต้องสะกดได้
-            guard typed.count >= 3, !Self.isEnglishWord(typed) else { return nil }
-            let converted = render(strokes, with: thai)
-            guard converted.unicodeScalars.allSatisfy(ThaiScript.isThai),
-                  ThaiScript.wellFormed(converted) else { return nil }
-            return (converted, true)
-        }
+        modelCorrection(for: strokes, partial: false)
     }
 
     private func autoFix(_ strokes: [Stroke], trailing: Int) {
@@ -3849,6 +3965,7 @@ final class LayoutFixer {
         lastFix = nil
         fixTail.removeAll()
         ignored.insert(fix.original)
+        learned.remove(fix.original)
 
         // ลบยาวถึงคำที่แก้ (หางทั้งหมด + ตัวคั่น + คำที่แก้) แล้วพิมพ์คำเดิม + หางคืนตามเดิม
         replace(count: fix.replacement.unicodeScalars.count + fix.trailing
@@ -3861,7 +3978,7 @@ final class LayoutFixer {
             // คืนปุ่มเดิมกลับเข้าบัฟเฟอร์ ไม่งั้นตัวที่พิมพ์ต่อจะนับผิด
             if fix.trailing == 0 {
                 word = fix.strokes
-                undoneLength = fix.original.count
+                undoneLength = fix.original.unicodeScalars.count
             } else {
                 word.removeAll()
                 undoneLength = 0
@@ -3902,22 +4019,26 @@ final class LayoutFixer {
         let toThai = !ThaiScript.hasThai(typed)
         let converted = render(target, with: toThai ? thai : latin)
         guard converted != typed else { if !silent { NSSound.beep() }; return }
+        learned.insert(typed)
+        ignored.remove(typed)
         apply(strokes: target, to: converted, toThai: toThai, trailing: trailing)
         if word.isEmpty { lastWord = [] } else { word.removeAll() }
     }
 
     // MARK: แปลงเฉพาะส่วนที่เลือก (คลุมดำ + กด Shift 2 ครั้ง)
 
-    private static var latinToThai: [Character: Character]?
-    private static var thaiToLatin: [Character: Character]?
+    // ตารางแปลงระดับ scalar (ไม่ใช่ Character) — สระ/วรรณยุกต์ไทยจะเกาะพยัญชนะเป็นกลุ่มเดียว
+    // ถ้าวนทีละ Character "รั" จะไม่เจอในตาราง
+    private static var latinToThai: [Unicode.Scalar: Unicode.Scalar]?
+    private static var thaiToLatin: [Unicode.Scalar: Unicode.Scalar]?
     private static func buildMaps() {
         guard latinToThai == nil, let thai = KeyLayouts.thai, let latin = KeyLayouts.latin else { return }
-        var l2t: [Character: Character] = [:], t2l: [Character: Character] = [:]
+        var l2t: [Unicode.Scalar: Unicode.Scalar] = [:], t2l: [Unicode.Scalar: Unicode.Scalar] = [:]
         for code in 0..<128 {
             for shift in [false, true] {
                 guard let ls = latin.text(code, shift: shift), let ts = thai.text(code, shift: shift),
-                      let lc = ls.count == 1 ? ls.first : nil,
-                      let tc = ts.count == 1 ? ts.first : nil else { continue }
+                      ls.unicodeScalars.count == 1, ts.unicodeScalars.count == 1,
+                      let lc = ls.unicodeScalars.first, let tc = ts.unicodeScalars.first else { continue }
                 if l2t[lc] == nil { l2t[lc] = tc }
                 if t2l[tc] == nil { t2l[tc] = lc }
             }
@@ -3937,12 +4058,29 @@ final class LayoutFixer {
         switch axSelectedText() {
         case .some(let sel) where !sel.isEmpty:      // มีข้อความเลือกอยู่ (ผ่าน AX) → แปลงเฉพาะส่วนนั้น
             if sel.count <= 500, let out = converted(from: sel) {
+                remember(sel)
                 typeOver(out, toThai: !ThaiScript.hasThai(sel))
             }
-        case .some:                                  // โฟกัสอยู่แต่ไม่ได้เลือกอะไร → ไม่ทำอะไร (กันลบมั่ว)
-            break
+        case .some:                                  // โฟกัสอยู่แต่ไม่ได้เลือกอะไร → ย้อนการแก้ที่เพิ่งทำ (ถ้ามี)
+            undoRecentFix()
         case .none:                                  // AX อ่านไม่ได้ (Electron/terminal/เว็บ) → ใช้ clipboard
             convertViaClipboard()
+        }
+    }
+
+    /// Shift×2 โดยไม่ได้เลือกอะไร = ย้อนการแก้อัตโนมัติที่เพิ่งเกิด — เฉพาะตอนยังไม่พิมพ์อะไรต่อ
+    /// (ลบแค่คำที่เราเพิ่งพิมพ์แทนให้ ไม่ไปไล่ลบตามบัฟเฟอร์ จึงไม่มีทางลบเกิน) แล้วจำว่าคำนี้ห้ามแตะ
+    private func undoRecentFix() {
+        guard let fix = lastFix, !busy,
+              fixTail.joined().unicodeScalars.count <= 12 else { return }   // แก้สดตั้งแต่ตัวที่ 3 → ผู้ใช้มักพิมพ์จบคำก่อนค่อยย้อน
+        revert(fix)
+    }
+
+    /// ผู้ใช้สั่งแปลงเอง = สอนระบบ: จำแต่ละคำในข้อความนั้นไว้ ครั้งหน้าเจอพิมพ์แบบเดิมแปลงให้ทันที
+    private func remember(_ text: String) {
+        for word in text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }) where word.count >= 3 && word.count <= 40 {
+            learned.insert(String(word))
+            ignored.remove(String(word))
         }
     }
 
@@ -3964,7 +4102,9 @@ final class LayoutFixer {
         Self.buildMaps()
         guard let l2t = Self.latinToThai, let t2l = Self.thaiToLatin else { return nil }
         let map = ThaiScript.hasThai(sel) ? t2l : l2t
-        let out = String(sel.map { map[$0] ?? $0 })
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: sel.unicodeScalars.map { map[$0] ?? $0 })
+        let out = String(scalars)
         return out != sel ? out : nil
     }
 
@@ -4000,10 +4140,12 @@ final class LayoutFixer {
         waitForCopy(pb: pb, before: before, tries: 15) { [weak self] copied in
             guard let self else { return }
             guard let sel = copied, !sel.isEmpty, sel.count <= 500, let out = self.converted(from: sel) else {
-                self.restore(pb, saved)      // ไม่มีอะไรเลือก / แปลงไม่ได้ → คืนคลิปบอร์ด แล้วจบ (ไม่แตะข้อความ)
+                self.restore(pb, saved)      // ไม่มีอะไรเลือก / แปลงไม่ได้ → คืนคลิปบอร์ด แล้วย้อนการแก้ล่าสุด (ถ้ามี)
                 self.busy = false
+                self.undoRecentFix()
                 return
             }
+            self.remember(sel)
             pb.clearContents(); pb.setString(out, forType: .string)
             SystemActions.postKey(kVK_ANSI_V, .maskCommand)   // วางทับ
             self.switchSource(toThai: !ThaiScript.hasThai(sel))
@@ -4063,7 +4205,7 @@ enum KeyboardStyle {
 /// แต่ละตัวคุมฟีเจอร์ทั้งกลุ่ม — ไม่มีสวิตช์ย่อยให้ปรับอีก
 enum MasterSwitch {
     case windowsSnap, livePreview
-    case windowsShortcuts, autoKeyboard, layoutFix, keyboardClean
+    case windowsShortcuts, autoKeyboard, layoutFix, layoutFixAuto, perAppLanguage, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
     case monitorCPU, monitorRAM, monitorSSD
     case launchAtLogin
@@ -4075,6 +4217,8 @@ enum MasterSwitch {
         case .windowsShortcuts: return KeyboardStyle.windowsActive
         case .autoKeyboard:     return Config.perKeyboard
         case .layoutFix:        return Config.layoutFix
+        case .layoutFixAuto:    return Config.layoutFixAuto
+        case .perAppLanguage:   return Config.perAppLanguage
         case .keyboardClean:    return KeyboardClean.shared.isOn
         case .mouseNatural:     return Config.mouseNaturalScroll
         case .trackpadNatural:  return Config.trackpadNaturalScroll
@@ -4117,6 +4261,10 @@ enum MasterSwitch {
         case .layoutFix:
             Config.layoutFix = value
             if value { KeyLayouts.reload() }
+        case .layoutFixAuto:
+            Config.layoutFixAuto = value
+        case .perAppLanguage:
+            Config.perAppLanguage = value
         case .keyboardClean:
             KeyboardClean.shared.set(value)
         case .mouseNatural:
@@ -6237,8 +6385,14 @@ final class ManualWindow: NSWindow {
              "Automatically follows whichever keyboard you type on — a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring.",
              "ปรับตามคีย์บอร์ดที่คุณพิมพ์ล่าสุดอัตโนมัติ คีย์บอร์ด Windows ได้คีย์ลัดแบบ Windows คีย์บอร์ด Mac ได้แบบ Mac ต้องเปิดสิทธิ์ Input Monitoring"),
             ("Convert Layout",
-             "Typed on the wrong layout (e.g. \"l;ylfu\" instead of \"สวัสดี\")? Select the text and double-tap Shift — Deft converts it (Thai↔English) and switches the input language. Works in any app. With nothing selected, it converts the last word you typed.",
-             "พิมพ์ผิดแป้น (เช่น \"l;ylfu\" แทน \"สวัสดี\") ใช่ไหม? คลุมดำข้อความนั้นแล้วกด Shift สองครั้ง Deft จะแปลงให้ (ไทย↔อังกฤษ) พร้อมสลับภาษาให้ ใช้ได้ทุกแอป ถ้าไม่ได้เลือกอะไร จะแปลงคำล่าสุดที่พิมพ์ให้แทน"),
+             "Typed on the wrong layout (e.g. \"l;ylfu\" instead of \"สวัสดี\")? Deft converts it (Thai↔English) and switches the input language for you. To convert by hand, select the text and double-tap Shift — works in any app. Double-tap Shift right after an automatic fix to undo it; Deft remembers that word and won't touch it again.",
+             "พิมพ์ผิดแป้น (เช่น \"l;ylfu\" แทน \"สวัสดี\") ใช่ไหม? Deft จะแปลงให้ (ไทย↔อังกฤษ) พร้อมสลับภาษาให้ ถ้าอยากแปลงเอง คลุมดำข้อความแล้วกด Shift สองครั้ง ใช้ได้ทุกแอป กด Shift สองครั้งทันทีหลังระบบแก้ให้ = ย้อนกลับ และ Deft จะจำคำนั้นไว้ไม่แตะอีก"),
+            ("Auto-Fix While Typing",
+             "Fixes wrong-layout words as you type — usually by the third letter, no need to press space or Enter. Decisions come from letter statistics of real Thai and English (not a dictionary), so names, slang, and chat words work too. Every word you undo or convert by hand teaches it.",
+             "แก้คำที่พิมพ์ผิดแป้นระหว่างพิมพ์ ปกติรู้ตั้งแต่ตัวอักษรที่สาม ไม่ต้องรอเว้นวรรคหรือ Enter ตัดสินจากสถิติลำดับตัวอักษรของภาษาไทยและอังกฤษจริง (ไม่ใช่พจนานุกรม) ชื่อคน คำแสลง ภาษาแชท จึงใช้ได้ด้วย ทุกคำที่คุณย้อนกลับหรือแปลงเองจะสอนระบบให้ฉลาดขึ้น"),
+            ("Per-App Language",
+             "Remembers the input language you last used in each app and switches back to it when you return — Thai in LINE, English in Terminal — just like Windows keeps a language per window.",
+             "จำภาษาที่ใช้ล่าสุดในแต่ละแอป แล้วสลับให้เองตอนกลับมาที่แอปนั้น เช่น LINE เป็นไทย Terminal เป็นอังกฤษ เหมือน Windows ที่จำภาษาแยกตามหน้าต่าง"),
             ("Language Switch Key",
              "Pick a Windows-style key to switch the input language: ` (~), Alt+Shift, Ctrl+Shift, or Win+Space. Works while Windows Shortcuts is on.",
              "เลือกปุ่มเปลี่ยนภาษาแบบ Windows: ` (~), Alt+Shift, Ctrl+Shift หรือ Win+Space ใช้ได้ตอนเปิด Windows Shortcuts"),
@@ -7209,6 +7363,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Config.migrate()
         Geometry.refresh()
         FrontApp.start()
+        LanguageMemory.start()
+        _ = LangModel.shared          // โหลดโมเดล Convert Layout ไว้ล่วงหน้า
         Updater.scheduleAutomatic()
 
         NotificationCenter.default.addObserver(
@@ -7437,7 +7593,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggle("Auto-Detect Keyboard", .autoKeyboard,
                             tip: "Follows whichever keyboard you type on: a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring"))
         menu.addItem(toggle("Convert Layout", .layoutFix,
-                            tip: ("Typed on the wrong layout, like \"l;ylfu\" for \"สวัสดี\"? Select the text and double-tap Shift to convert it (Thai↔English) and switch the input language. Nothing selected → converts the last word")))
+                            tip: ("Typed on the wrong layout, like \"l;ylfu\" for \"สวัสดี\"? Deft converts it (Thai↔English) and switches the input language. Select text and double-tap Shift to convert by hand; double-tap Shift right after a fix to undo it")))
+        if Config.layoutFix {
+            menu.addItem(toggle("Auto-Fix While Typing", .layoutFixAuto,
+                                tip: "Fixes wrong-layout words as you type, usually by the third letter — no need to press space. Learns from every word you undo or convert by hand", indent: 10))
+            menu.addItem(toggle("Per-App Language", .perAppLanguage,
+                                tip: "Remembers the input language you last used in each app and restores it when you switch back — like Windows does per window", indent: 10))
+        }
         // แถวสวิตช์ + ลูกศรกาง แบบเดียวกับแถวจอ: สวิตช์ = เปิด/ปิดปุ่มเปลี่ยนภาษา ลูกศร = เลือกว่าปุ่มไหน
         let languageKeys: [(String, CGFloat)] = [("` (~ key)", 1), ("Alt+Shift", 2), ("Ctrl+Shift", 4), ("Win+Space", 3)]
         let languageRow = MenuSwitchExpandRow(

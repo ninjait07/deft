@@ -49,6 +49,8 @@ pkill -x "$NAME" 2>/dev/null || true
 echo "==> คอมไพล์"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# โมเดลสถิติตัวอักษรของ Convert Layout (สร้างด้วย tools/build-langmodel.py)
+cp "$SRC_DIR/Resources/"*.bin "$APP/Contents/Resources/" 2>/dev/null || true
 
 swiftc -O -swift-version 5 \
     -target arm64-apple-macos13.0 \
