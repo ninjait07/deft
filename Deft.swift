@@ -5162,22 +5162,40 @@ final class InputTap {
     // MARK: ล้อเมาส์ — แยกจาก trackpad
 
     /// คืน nil = กลืนอีเวนต์ (Ctrl+ล้อ = ซูม) · คืน pass = ปล่อยผ่านเดิม · คืนอีเวนต์ใหม่ = ใช้แทนของเดิม
+    /// แอปที่ไม่ซูมด้วย ⌘+ล้อเมาส์ แต่มีคีย์ ⌘+ / ⌘− — Ctrl+ล้อ จะถูกส่งเป็นคีย์แทน
+    private static let keystrokeZoomApps: Set<String> = [
+        "com.apple.Safari", "com.apple.Notes", "com.apple.TextEdit", "com.apple.mail", "com.apple.Preview",
+        "com.apple.iWork.Pages", "com.apple.iWork.Numbers", "com.apple.iWork.Keynote",
+        "com.apple.dt.Xcode", "com.apple.finder",
+        "com.microsoft.VSCode", "com.google.antigravity-ide", "com.todesktop.230313mzl4w4u92" /* Cursor */,
+        "jp.naver.line.mac", "com.tinyspeck.slackmacgap", "com.hnc.Discord", "notion.id",
+    ]
+
     private func handleScroll(_ event: CGEvent, pass: Unmanaged<CGEvent>) -> Unmanaged<CGEvent>? {
         // trackpad ส่งค่าแบบต่อเนื่อง (พิกเซล + phase/momentum) ล้อเมาส์ส่งเป็นขั้น
         let continuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
 
-        // Ctrl+ล้อเมาส์ = ซูมเข้า/ออก เหมือน Windows — แปลงเป็น Cmd+= / Cmd+- (เฉพาะล้อเมาส์ โหมด Windows)
+        // Ctrl+ล้อเมาส์ = ซูมเข้า/ออก เหมือน Windows (เฉพาะล้อเมาส์ โหมด Windows)
         // โหมด Mac ปล่อยผ่าน ให้ Ctrl+ล้อเมาส์ทำงานแบบระบบเดิม (ซูมหน้าจอของ macOS)
+        // แอปส่วนใหญ่ที่ซูมด้วยล้อได้ (Chrome/Firefox/Office/Adobe/Figma/Maps…) ใช้ ⌘+ล้อ → ส่งอีเวนต์ล้อ
+        // ที่ถือ ⌘ ไปให้ตรง ๆ  ·  แอปที่ไม่มีซูมด้วยล้อแต่มี ⌘+/⌘− (Safari, Notes, IDE…) → ส่งเป็นคีย์แทน
+        var flags = event.flags
         if !continuous, KeyboardStyle.windowsActive,
-           event.flags.contains(.maskControl), !event.flags.contains(.maskCommand),
+           flags.contains(.maskControl), !flags.contains(.maskCommand),
            !FrontApp.isTerminal {
-            let raw = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
-            if raw != 0 {
-                // ทิศซูมอิงจากทิศเลื่อนจริงหลังปรับ Natural Scroll ของเมาส์ จะได้ตรงกับการเลื่อนปกติ
-                let delta = ScrollDirection.mouseNeedsFlip ? -raw : raw
-                SystemActions.postKey(delta > 0 ? kVK_ANSI_Equal : kVK_ANSI_Minus, .maskCommand)
-                return nil
+            if Self.keystrokeZoomApps.contains(FrontApp.bundleID) {
+                let raw = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+                if raw != 0 {
+                    // ทิศซูมอิงจากทิศเลื่อนจริงหลังปรับ Natural Scroll ของเมาส์ จะได้ตรงกับการเลื่อนปกติ
+                    let delta = ScrollDirection.mouseNeedsFlip ? -raw : raw
+                    SystemActions.postKey(delta > 0 ? kVK_ANSI_Equal : kVK_ANSI_Minus, .maskCommand)
+                    return nil
+                }
             }
+            flags.remove(.maskControl)
+            flags.insert(.maskCommand)
+            event.flags = flags   // แอปที่รองรับ ⌘+ล้อ จะซูมเอง (ตกไปทางกลับทิศ/ปรับความเร็วด้านล่างตามปกติ)
+            if !(ScrollDirection.mouseNeedsFlip || Config.mouseScrollSpeed != 1.0) { return pass }
         }
 
         // กลับทิศเฉพาะอุปกรณ์ที่ทิศที่อยากได้ไม่ตรงกับค่า Natural scrolling ของระบบ
