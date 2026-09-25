@@ -40,6 +40,7 @@ Or with Homebrew:
 
 ```
 brew tap ninjait07/deft https://github.com/ninjait07/deft
+brew trust ninjait07/deft
 brew install --cask deft
 ```
 
