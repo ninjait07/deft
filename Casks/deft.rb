@@ -7,7 +7,7 @@ cask "deft" do
   desc "Windows-style window management and keyboard for macOS"
   homepage "https://github.com/ninjait07/deft"
 
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "Deft.app"
 
