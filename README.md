@@ -36,6 +36,13 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 
 The app is signed with a Developer ID and notarized by Apple, so it opens without security warnings.
 
+Or with Homebrew:
+
+```
+brew tap ninjait07/deft https://github.com/ninjait07/deft
+brew install --cask deft
+```
+
 ## Permissions & privacy
 
 Deft works entirely on your Mac and collects nothing. It uses:
