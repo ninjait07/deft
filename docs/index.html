@@ -81,6 +81,8 @@
   .shots figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;text-align:center}
   .shots img{max-width:100%;height:auto;border-radius:10px;display:block;margin:0 auto}
   .shots figcaption{color:var(--muted);font-size:13px;margin-top:10px}
+  .shots.demos{grid-template-columns:1fr}
+  .shots.demos img{max-width:900px;width:100%}
   .shots figure:first-child{grid-column:1/-1}
   .shots figure:first-child img{max-width:520px}
   .support{text-align:center;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:34px}
@@ -96,6 +98,7 @@
     <div class="brand"><img src="icon.png" alt="Deft"> Deft</div>
     <nav>
       <a href="#features">Features</a>
+      <a href="#demo">Demo</a>
       <a href="#screens">Screenshots</a>
       <a href="#install">Install</a>
       <a href="https://github.com/ninjait07/deft">GitHub</a>
@@ -125,6 +128,16 @@
       <div class="card"><div class="ic">✳️</div><h3>Claude Code usage</h3><p>See how much of your 5-hour Claude Code window you've used, right next to CPU/RAM — estimated from local logs, no account needed.</p></div>
       <div class="card"><div class="ic">🖥️</div><h3>Display controls</h3><p>Resolution, refresh rate, rotation, main display, power a display off, and drag-to-arrange displays.</p></div>
       <div class="card"><div class="ic">🧽</div><h3>Clean Keyboard</h3><p>Lock every key, Fn, and media button so you can safely wipe the keyboard.</p></div>
+    </div>
+  </section>
+
+  <section id="demo">
+    <div class="eyebrow">See it move</div>
+    <h2>Snapping that feels like home</h2>
+    <div class="shots demos">
+      <figure><img src="img/snap.gif" alt="Dragging a window to the left edge snaps it, then Snap Assist fills the right half"><figcaption>Drag to an edge — Snap Assist fills the rest</figcaption></figure>
+      <figure><img src="img/layouts.gif" alt="Dragging a window to the top opens Snap Layouts"><figcaption>Snap Layouts — drag to the top, pick a zone</figcaption></figure>
+      <figure><img src="img/alttab.gif" alt="Alt+Tab switcher with live window previews"><figcaption>Alt+Tab with live previews</figcaption></figure>
     </div>
   </section>
 

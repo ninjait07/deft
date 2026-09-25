@@ -18,6 +18,20 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 - **Clean Keyboard** — lock every key so you can wipe the keyboard.
 - **Manual** — a built-in guide to every feature, in English and Thai.
 
+## See it move
+
+**Drag to an edge to snap — Snap Assist fills the rest**
+
+![Snap and Snap Assist](docs/img/snap.gif)
+
+**Snap Layouts — drag to the top and pick a layout**
+
+![Snap Layouts](docs/img/layouts.gif)
+
+**Alt+Tab with live window previews**
+
+![Alt+Tab switcher](docs/img/alttab.gif)
+
 ## Screenshots
 
 | Menu bar | System Monitor & Claude Code usage |

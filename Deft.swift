@@ -544,11 +544,15 @@ final class Thumbnails {
 enum WindowIndex {
     /// เรียงจากหน้าสุดไปหลังสุด (= ลำดับที่ใช้ล่าสุด) ตามที่ Alt+Tab ของ Windows ใช้
     /// ลำดับ z มาจาก CGWindowList ส่วนชื่อ/ขนาดมาจาก AX (ไม่ต้องขอสิทธิ์ Screen Recording)
+    /// โหมดอัดภาพสาธิต (dev): แสดงเฉพาะหน้าต่างของแอปเหล่านี้ — กันหน้าต่างส่วนตัวหลุดเข้าภาพ
+    static var demoOnlyApps: Set<String>?
+
     static func ordered(includeMinimized: Bool = true) -> [WindowInfo] {
         var byApp: [pid_t: [WindowInfo]] = [:]
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             let pid = app.processIdentifier
             if pid == getpid() { continue }
+            if let only = demoOnlyApps, !only.contains(app.bundleIdentifier ?? "") { continue }
             let appElement = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appElement, 0.2)
             guard let windows = AX.attribute(appElement, kAXWindowsAttribute) as? [AXUIElement] else { continue }
@@ -6875,6 +6879,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FrontApp.start()
         Updater.scheduleAutomatic()
         installScreenshotHook()
+        installRecorderHook()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -7006,6 +7011,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] note in
             guard let dir = note.userInfo?["dir"] as? String else { return }
             self?.exportScreens(to: URL(fileURLWithPath: dir))
+        }
+    }
+
+    /// อัด GIF ของพื้นที่บนจอ (dev) — ใช้ทำภาพสาธิตในเอกสาร
+    /// userInfo: path, seconds, fps, width (px ของ GIF), x,y,w,h (พิกัด CG มุมซ้ายบน)
+    private var demoBackdrops: [NSWindow] = []
+
+    private func installRecorderHook() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.nonbannawat.deft.backdrop"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            self.demoBackdrops.forEach { $0.orderOut(nil) }
+            self.demoBackdrops = []
+            WindowIndex.demoOnlyApps = nil
+            guard (note.userInfo?["on"] as? String) == "1" else { return }
+            WindowIndex.demoOnlyApps = ["com.apple.TextEdit", "com.apple.finder", "com.apple.Notes",
+                                        "com.apple.Safari", "com.apple.Preview", "com.apple.calculator"]
+            self.demoBackdrops = NSScreen.screens.map { target in
+                let w = NSWindow(contentRect: target.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                w.level = .normal
+                w.isOpaque = true
+                w.hasShadow = false
+                w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+                let v = NSView(frame: NSRect(origin: .zero, size: target.frame.size))
+                v.wantsLayer = true
+                let g = CAGradientLayer()
+                g.frame = v.bounds
+                g.colors = [NSColor(red: 0.09, green: 0.12, blue: 0.24, alpha: 1).cgColor,
+                            NSColor(red: 0.28, green: 0.14, blue: 0.36, alpha: 1).cgColor,
+                            NSColor(red: 0.06, green: 0.25, blue: 0.34, alpha: 1).cgColor]
+                g.startPoint = CGPoint(x: 0, y: 1); g.endPoint = CGPoint(x: 1, y: 0)
+                v.layer?.addSublayer(g)
+                w.contentView = v
+                w.orderFrontRegardless()
+                return w
+            }
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.nonbannawat.deft.record"), object: nil, queue: .main
+        ) { note in
+            guard let info = note.userInfo, let path = info["path"] as? String else { return }
+            func num(_ k: String, _ d: Double) -> Double { Double(info[k] as? String ?? "") ?? d }
+            let rect = CGRect(x: num("x", 0), y: num("y", 0), width: num("w", 1280), height: num("h", 800))
+            let fps = num("fps", 12), seconds = num("seconds", 5), width = num("width", 960)
+            var frames: [CGImage] = []
+            let total = Int(seconds * fps)
+            func shrink(_ frame: CGImage) -> CGImage? {
+                let scale = width / Double(frame.width)
+                let w = Int(Double(frame.width) * scale), h = Int(Double(frame.height) * scale)
+                guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                ctx.interpolationQuality = .high
+                ctx.draw(frame, in: CGRect(x: 0, y: 0, width: w, height: h))
+                return ctx.makeImage()
+            }
+            let timer = Timer(timeInterval: 1 / fps, repeats: true) { t in
+                if let shot = Thumbnails.captureScreen(rect), let small = shrink(shot) { frames.append(small) }
+                guard frames.count >= total else { return }
+                t.invalidate()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let url = URL(fileURLWithPath: path) as CFURL
+                    guard let dest = CGImageDestinationCreateWithURL(url, UTType.gif.identifier as CFString, frames.count, nil) else { return }
+                    CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+                    let frameProps = [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: 1 / fps]] as CFDictionary
+                    for frame in frames { CGImageDestinationAddImage(dest, frame, frameProps) }
+                    CGImageDestinationFinalize(dest)
+                    knackLog("rec: \(frames.count) frames → \(path)")
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
         }
     }
 
