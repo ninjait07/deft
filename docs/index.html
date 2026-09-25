@@ -76,6 +76,12 @@
     display:grid;place-items:center;font-size:13px}
   ol.steps b{color:var(--ink)}
 
+  .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;align-items:start}
+  .shots figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;text-align:center}
+  .shots img{max-width:100%;height:auto;border-radius:10px;display:block;margin:0 auto}
+  .shots figcaption{color:var(--muted);font-size:13px;margin-top:10px}
+  .shots figure:first-child{grid-column:1/-1}
+  .shots figure:first-child img{max-width:520px}
   .support{text-align:center;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:34px}
   footer{border-top:1px solid var(--line);padding:26px 0 50px;color:var(--muted);font-size:13px;
     display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
@@ -89,6 +95,7 @@
     <div class="brand"><img src="icon.png" alt="Deft"> Deft</div>
     <nav>
       <a href="#features">Features</a>
+      <a href="#screens">Screenshots</a>
       <a href="#install">Install</a>
       <a href="https://github.com/ninjait07/deft">GitHub</a>
     </nav>
@@ -113,9 +120,22 @@
       <div class="card"><div class="ic">🔀</div><h3>Live Preview switcher</h3><p>Real, moving window thumbnails in Alt+Tab and Cmd+Tab, Snap Assist, and when you hover the Dock.</p></div>
       <div class="card"><div class="ic">⌨️</div><h3>Windows keyboard</h3><p>Ctrl works as Cmd, the Win key, F-keys, Home/End, Explorer keys in Finder — with auto keyboard detection.</p></div>
       <div class="card"><div class="ic">🖱️</div><h3>Mouse &amp; scroll</h3><p>Independent natural-scroll for mouse and trackpad, side-button back/forward, and Ctrl+scroll to zoom.</p></div>
-      <div class="card"><div class="ic">📊</div><h3>System Monitor</h3><p>Live CPU, RAM, and SSD activity right in the menu bar.</p></div>
+      <div class="card"><div class="ic">📊</div><h3>System Monitor</h3><p>Live CPU, RAM, and SSD cells in the menu bar, smoothly animated. Click for details.</p></div>
+      <div class="card"><div class="ic">✳️</div><h3>Claude Code usage</h3><p>See how much of your 5-hour Claude Code window you've used, right next to CPU/RAM — estimated from local logs, no account needed.</p></div>
       <div class="card"><div class="ic">🖥️</div><h3>Display controls</h3><p>Resolution, refresh rate, rotation, main display, power a display off, and drag-to-arrange displays.</p></div>
       <div class="card"><div class="ic">🧽</div><h3>Clean Keyboard</h3><p>Lock every key, Fn, and media button so you can safely wipe the keyboard.</p></div>
+    </div>
+  </section>
+
+  <section id="screens">
+    <div class="eyebrow">A closer look</div>
+    <h2>Liquid Glass, everywhere</h2>
+    <div class="shots">
+      <figure><img src="img/menubar.png" alt="Menu bar: CPU, RAM and Claude Code cells"><figcaption>CPU · RAM · Claude Code, beside the Deft icon</figcaption></figure>
+      <figure><img src="img/menu.png" alt="The Deft menu"><figcaption>Everything is a switch</figcaption></figure>
+      <figure><img src="img/monitor.png" alt="System Monitor details with Claude Code usage"><figcaption>Click a cell for details</figcaption></figure>
+      <figure><img src="img/arrange.png" alt="Arrange Displays window"><figcaption>Drag displays into place, rotate, set main</figcaption></figure>
+      <figure><img src="img/manual.png" alt="Built-in Manual"><figcaption>Built-in Manual, English and Thai</figcaption></figure>
     </div>
   </section>
 

@@ -4,15 +4,29 @@
 
 Deft is a lightweight macOS menu-bar app that brings the window-management and keyboard behaviour of Windows to your Mac, without changing anything permanently.
 
+<p align="center"><img src="docs/img/menu.png" width="360" alt="Deft menu"></p>
+
 ## Features
 
-- **Windows Snap** — drag windows to edges/corners to snap them; Snap Layouts, Snap Assist, shared resize dividers, and `Win`+arrow keys.
-- **Live Preview** — real, moving window thumbnails in the switcher (`Alt`+`Tab` / `Cmd`+`Tab`), Snap Assist, and Dock hover.
-- **Windows keyboard** — `Ctrl` acts as `Cmd`, the `Win` key, F-keys, Home/End, Explorer keys in Finder, and auto-detection of Windows vs Mac keyboards.
-- **Mouse & scroll** — independent natural-scroll for mouse and trackpad, side-button back/forward, `Ctrl`+scroll to zoom.
-- **System Monitor** — live CPU, RAM, and SSD activity in the menu bar.
+- **Windows Snap** — drag windows to edges/corners to snap them; Snap Layouts, Snap Assist, shared resize dividers, and `Win`+arrow keys. A maximized window shrinks to half size the moment you drag it, like Windows.
+- **Live Preview** — real, moving window thumbnails in the switcher (`Alt`+`Tab` in Windows mode, `Cmd`+`Tab` in Mac mode), Snap Assist, and when hovering the Dock.
+- **Windows keyboard** — `Ctrl` acts as `Cmd`, the `Win` key, F-keys, Home/End, Explorer keys in Finder, a Windows-style language switch key, and auto-detection of Windows vs Mac keyboards.
+- **Mouse & scroll** — independent natural-scroll for mouse and trackpad, side-button back/forward, and `Ctrl`+scroll to zoom (sent as `⌘`+scroll to apps that zoom that way, `⌘+`/`⌘−` to the rest).
+- **System Monitor** — live CPU, RAM, and SSD cells in the menu bar with smooth animation; click for details.
+- **AI Usage** — a Claude Code cell next to CPU/RAM showing how much of the current 5-hour window you've used, estimated from Claude Code's local logs (no account, nothing leaves your Mac). Click for tokens, approximate cost, and reset time.
 - **Display controls** — resolution, refresh rate, rotation, set main display, power a display off, and a drag-to-arrange window.
 - **Clean Keyboard** — lock every key so you can wipe the keyboard.
+- **Manual** — a built-in guide to every feature, in English and Thai.
+
+## Screenshots
+
+| Menu bar | System Monitor & Claude Code usage |
+|---|---|
+| ![Menu bar cells](docs/img/menubar.png) | <img src="docs/img/monitor.png" width="340" alt="Monitor details"> |
+
+| Arrange Displays | Manual |
+|---|---|
+| <img src="docs/img/arrange.png" width="420" alt="Arrange Displays"> | <img src="docs/img/manual.png" width="360" alt="Manual"> |
 
 ## Install
 

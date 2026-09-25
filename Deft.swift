@@ -462,6 +462,14 @@ final class Thumbnails {
         return high - low < 10
     }
 
+    /// ภาพรวมของจอในกรอบที่กำหนด (ต้องมีสิทธิ์ Screen Recording) — ใช้ทำภาพประกอบเอกสาร
+    static func captureScreen(_ rect: CGRect) -> CGImage? {
+        guard let fn = legacyCaptureFn else { return nil }
+        let onScreenOnly: UInt32 = 1 << 0
+        let bestResolution: UInt32 = 1 << 3
+        return fn(rect, onScreenOnly, 0, bestResolution)?.takeRetainedValue()
+    }
+
     private static func legacyCapture(_ id: CGWindowID) -> NSImage? {
         guard let fn = legacyCaptureFn else { return nil }
         let includingWindow: UInt32 = 1 << 3          // kCGWindowListOptionIncludingWindow
@@ -5091,17 +5099,6 @@ final class AIUsage {
         }
     }
 
-    /// ตัวเลขจริงจากบัญชี (endpoint usage ของ Anthropic ที่ /usage ใน Claude Code ใช้) — 0…1
-    struct Official {
-        var fiveHour: Double, fiveHourResets: Date?
-        var sevenDay: Double, sevenDayResets: Date?
-        var opusWeek: Double?, opusWeekResets: Date?
-        var fetchedAt: Date
-    }
-    private(set) var official: Official?
-    private(set) var officialError: String?
-    private var fetching = false
-
     struct Snapshot {
         var current: Block?
         var limit = 0                  // token ที่ถือเป็น 100% ของหน้าต่าง
@@ -5121,11 +5118,8 @@ final class AIUsage {
     private var offsets: [String: Int] = [:]          // path → byte ที่อ่านถึงแล้ว
     private let queue = DispatchQueue(label: "deft.aiusage", qos: .utility)
     private var timer: Timer?
-    /// ค่าที่ช่องบนเมนูบาร์ใช้: ตัวเลขจริงถ้ามี (ไม่เก่าเกิน 10 นาที) ไม่งั้นค่าประมาณจาก log
-    var display: (fraction: Double, live: Bool) {
-        if let o = official, Date().timeIntervalSince(o.fetchedAt) < 600 { return (o.fiveHour, true) }
-        return (snapshot.fraction, false)
-    }
+    /// ค่าที่ช่องบนเมนูบาร์ใช้ — สัดส่วนของหน้าต่าง 5 ชม. ปัจจุบัน (ประมาณจาก log ในเครื่อง)
+    var display: Double { snapshot.fraction }
     private static let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
     private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
@@ -5141,13 +5135,7 @@ final class AIUsage {
     private func start() {
         guard timer == nil else { return }
         scan()
-        fetchOfficial()
-        var ticks = 0
-        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            ticks += 1
-            self?.scan()
-            if ticks % 2 == 0 { self?.fetchOfficial() }     // ทุก 60 วิ
-        }
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.scan() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
@@ -5156,83 +5144,6 @@ final class AIUsage {
         timer?.invalidate(); timer = nil
     }
 
-    // MARK: ตัวเลขจริงจากบัญชี Claude Code
-
-    /// token ล็อกอินของ Claude Code อยู่ใน Keychain (service "Claude Code-credentials") — macOS จะถามผู้ใช้ก่อนให้อ่าน
-    /// เราไม่เก็บ ไม่ log และส่งไปที่ api.anthropic.com เท่านั้น
-    private static func claudeAccessToken() -> (token: String?, error: String?) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess else {
-            switch status {
-            case errSecItemNotFound: return (nil, "Claude Code isn't signed in on this Mac")
-            case errSecAuthFailed, errSecUserCanceled, errSecInteractionNotAllowed:
-                return (nil, "Keychain access was denied — allow Deft to read Claude Code's sign-in")
-            default: return (nil, "Keychain error \(status)")
-            }
-        }
-        guard let data = result as? Data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String, !token.isEmpty else {
-            return (nil, "Couldn't read Claude Code's sign-in")
-        }
-        if let expires = oauth["expiresAt"] as? Double, expires / 1000 < Date().timeIntervalSince1970 {
-            return (nil, "Sign-in expired — use Claude Code once to refresh it")
-        }
-        return (token, nil)
-    }
-
-    func fetchOfficial() {
-        guard !fetching else { return }
-        fetching = true
-        DispatchQueue.global(qos: .utility).async { [self] in
-            let (token, error) = Self.claudeAccessToken()
-            guard let token else {
-                DispatchQueue.main.async { self.officialError = error; self.fetching = false; self.push() }
-                return
-            }
-            var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 15
-            URLSession.shared.dataTask(with: request) { data, response, err in
-                var parsed: Official?
-                var failure: String?
-                if let err { failure = err.localizedDescription }
-                else if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                    failure = http.statusCode == 401 ? "Sign-in expired — use Claude Code once to refresh it"
-                                                     : "Anthropic replied \(http.statusCode)"
-                } else if let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    func window(_ key: String) -> (Double, Date?)? {
-                        guard let w = json[key] as? [String: Any], let u = w["utilization"] as? Double else { return nil }
-                        let resets = (w["resets_at"] as? String).flatMap { Self.iso.date(from: $0) ?? Self.isoPlain.date(from: $0) }
-                        return (min(1, max(0, u / 100)), resets)
-                    }
-                    if let five = window("five_hour"), let week = window("seven_day") {
-                        let opus = window("seven_day_opus")
-                        parsed = Official(fiveHour: five.0, fiveHourResets: five.1, sevenDay: week.0, sevenDayResets: week.1,
-                                          opusWeek: opus?.0, opusWeekResets: opus?.1, fetchedAt: Date())
-                    } else { failure = "Unexpected reply from Anthropic" }
-                } else { failure = "No reply from Anthropic" }
-                DispatchQueue.main.async {
-                    if let parsed { self.official = parsed; self.officialError = nil }
-                    else { self.officialError = failure }
-                    self.fetching = false
-                    self.push()
-                }
-            }.resume()
-        }
-    }
-
-    /// อัปเดตแก้ว: ใช้ตัวเลขจริงถ้ามี (ไม่เก่าเกิน 10 นาที) ไม่งั้นใช้ค่าประมาณจาก log
     private func push() { SystemMonitor.shared.redraw() }
 
     // MARK: อ่าน log แบบต่อท้าย (ไฟล์ jsonl มีแต่เพิ่ม ไม่แก้ของเก่า)
@@ -5344,26 +5255,14 @@ final class AIUsage {
     func detailRows() -> [MenuRowView] {
         let s = snapshot
         var rows: [MenuRowView] = []
-        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: official != nil ? "Live" : "Estimate"))
-        if let o = official {
-            rows.append(UsageBarRow(percent: o.fiveHour, label: "Current",
-                                    detail: o.fiveHourResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "5-hour window"))
-            rows.append(UsageBarRow(percent: o.sevenDay, label: "Weekly",
-                                    detail: o.sevenDayResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
-            if let opus = o.opusWeek, opus > 0 {
-                rows.append(UsageBarRow(percent: opus, label: "Opus weekly",
-                                        detail: o.opusWeekResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
-            }
+        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: "Estimate"))
+        if !s.scanned {
+            rows.append(MenuNoteRow("Reading usage logs…"))
+        } else if let b = s.current, b.isActive {
+            rows.append(UsageBarRow(percent: s.fraction, label: "Current window",
+                                    detail: "Resets in \(Self.countdown(to: b.end)) · \(Self.tokens(b.tokens)) / \(Self.tokens(s.limit)) tokens"))
         } else {
-            if let error = officialError { rows.append(MenuNoteRow(error)) }
-            if !s.scanned {
-                rows.append(MenuNoteRow("Reading usage logs…"))
-            } else if let b = s.current, b.isActive {
-                rows.append(UsageBarRow(percent: s.fraction, label: "Current ≈",
-                                        detail: "Resets in \(Self.countdown(to: b.end)) · \(Self.tokens(b.tokens)) / \(Self.tokens(s.limit)) tokens"))
-            } else {
-                rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
-            }
+            rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
         }
         rows.append(MenuSeparatorRow())
         if let b = s.current, b.isActive {
@@ -5372,20 +5271,15 @@ final class AIUsage {
         rows.append(MenuNoteRow("Today   \(Self.tokens(s.todayTokens)) tokens   \(Self.money(s.todayCost))"))
         rows.append(MenuNoteRow("This month   \(Self.tokens(s.monthTokens)) tokens   \(Self.money(s.monthCost))"))
         rows.append(MenuSeparatorRow())
-        if official == nil {
-            let limitLabel = Config.aiUsageLimit > 0 ? "Limit: \(Self.tokens(Int(Config.aiUsageLimit))) (set by you)"
-                                                    : "Limit: auto = heaviest window seen (\(Self.tokens(s.maxBlock)))"
-            rows.append(MenuNoteRow(limitLabel))
-            rows.append(MenuActionRow(title: "Set window limit…", symbolName: "slider.horizontal.3") { [weak self] in self?.askLimit() })
-            if Config.aiUsageLimit > 0 {
-                rows.append(MenuActionRow(title: "Back to auto limit", symbolName: "arrow.uturn.backward") { [weak self] in
-                    Config.aiUsageLimit = 0; self?.scan()
-                })
-            }
+        let limitLabel = Config.aiUsageLimit > 0 ? "Limit: \(Self.tokens(Int(Config.aiUsageLimit))) (set by you)"
+                                                : "Limit: auto = heaviest window seen (\(Self.tokens(s.maxBlock)))"
+        rows.append(MenuNoteRow(limitLabel))
+        rows.append(MenuActionRow(title: "Set window limit…", symbolName: "slider.horizontal.3") { [weak self] in self?.askLimit() })
+        if Config.aiUsageLimit > 0 {
+            rows.append(MenuActionRow(title: "Back to auto limit", symbolName: "arrow.uturn.backward") { [weak self] in
+                Config.aiUsageLimit = 0; self?.scan()
+            })
         }
-        rows.append(MenuActionRow(title: "Refresh Claude usage", symbolName: "arrow.clockwise") { [weak self] in
-            self?.fetchOfficial(); self?.scan()
-        })
         return rows
     }
 
@@ -5609,6 +5503,12 @@ final class SystemMonitor: NSObject {
         if item != nil { layout(); tick() }   // เปลี่ยนชุดที่โชว์แล้ววาดใหม่ทันที
     }
 
+    /// กรอบบนจอของแถบ (ใช้ถ่ายภาพประกอบเอกสาร)
+    var screenFrame: NSRect? {
+        guard let button = item?.button, let window = button.window else { return nil }
+        return window.convertToScreen(button.convert(button.bounds, to: nil))
+    }
+
     /// AIUsage ได้ตัวเลขใหม่ → วาดช่อง Claude ใหม่ (ไม่ต้องรอรอบ 2 วิ)
     func redraw() { if item != nil { cellsView.cells = cells() } }
 
@@ -5793,8 +5693,7 @@ final class SystemMonitor: NSObject {
         if Config.monitorRAM { result.append(.init(symbol: "memorychip", percent: Self.percent(sample.ramUsed, sample.ramTotal))) }
         if Config.monitorSSD { result.append(.init(symbol: "internaldrive", percent: Int(sample.diskBusy.rounded()))) }
         if Config.aiUsage {
-            let ai = AIUsage.shared.display
-            result.append(.init(symbol: "claude", percent: Int((ai.fraction * 100).rounded()), prefix: ai.live ? "" : "≈"))
+            result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded())))
         }
         return result
     }
@@ -5802,7 +5701,7 @@ final class SystemMonitor: NSObject {
     // MARK: เมนูรายละเอียด
 
     /// คลิกตัวเลข = เมนูกระจกรายละเอียด (แผ่นเดียวกับเมนูหลัก ใช้สลับกัน)
-    @objc private func toggleDetails() {
+    @objc func toggleDetails() {
         let panel = MenuPanel.shared
         if panel.isVisible || CFAbsoluteTimeGetCurrent() - panel.dismissedAt < 0.25 {
             panel.dismiss()
@@ -6008,8 +5907,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("AI Usage", "โควต้า AI", [
             ("Claude Code Quota",
-             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and the percentage of the current 5-hour window used (orange → red as it fills). The number comes live from your Claude account — Deft reads Claude Code's sign-in from the Keychain (macOS asks you once) and talks only to api.anthropic.com. If that isn't available, it shows an estimate (marked ≈) from Claude Code's local logs. Click the cell for the weekly limit, tokens used, an approximate cost at API prices, and reset times.",
-             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับเปอร์เซ็นต์ของหน้าต่าง 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขมาจากบัญชี Claude ของคุณโดยตรง Deft อ่านการล็อกอินของ Claude Code จาก Keychain (macOS จะถามคุณครั้งเดียว) และคุยกับ api.anthropic.com เท่านั้น ถ้าใช้ไม่ได้จะแสดงค่าประมาณ (มี ≈ นำหน้า) จาก log ในเครื่อง คลิกที่ช่องเพื่อดูโควต้ารายสัปดาห์ token ที่ใช้ ค่าใช้จ่ายโดยประมาณตามราคา API และเวลารีเซ็ต"),
+             "Shows your Claude Code usage on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour window you've used (orange → red as it fills). It's estimated from Claude Code's own logs on this Mac — no account to link and nothing leaves your computer. Anthropic doesn't publish exact plan limits, so 100% is the heaviest window you've ever used, or a limit you set. Click the cell for tokens used, an approximate cost at API prices, time until the window resets, and today's / this month's totals. For the official numbers, use /usage inside Claude Code.",
+             "แสดงการใช้งาน Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนของหน้าต่าง 5 ชั่วโมงปัจจุบันที่ใช้ไป (ส้ม → แดงเมื่อใกล้เต็ม) ประมาณจาก log ของ Claude Code ในเครื่องนี้เอง ไม่ต้องผูกบัญชีและไม่มีอะไรถูกส่งออกไป Anthropic ไม่ประกาศเพดานที่แน่นอน จึงถือหน้าต่างที่เคยใช้หนักสุดเป็น 100% หรือตั้งเพดานเองก็ได้ คลิกที่ช่องเพื่อดู token ที่ใช้ ค่าใช้จ่ายโดยประมาณตามราคา API เวลาที่เหลือก่อนรีเซ็ต และยอดรวมวันนี้/เดือนนี้ ตัวเลขทางการดูได้จาก /usage ใน Claude Code"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",
@@ -6975,6 +6874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Geometry.refresh()
         FrontApp.start()
         Updater.scheduleAutomatic()
+        installScreenshotHook()
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -7097,6 +6997,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.action = #selector(toggleMenu)
         statusItem.button?.sendAction(on: [.leftMouseDown])
         updateStatusItem()
+    }
+
+    // MARK: ถ่ายภาพประกอบเอกสาร (dev) — `deft-shots <dir>` ส่ง notification มา แอปเปิดแต่ละหน้าแล้วถ่ายให้
+    private func installScreenshotHook() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.nonbannawat.deft.export-screens"), object: nil, queue: .main
+        ) { [weak self] note in
+            guard let dir = note.userInfo?["dir"] as? String else { return }
+            self?.exportScreens(to: URL(fileURLWithPath: dir))
+        }
+    }
+
+    private func exportScreens(to dir: URL) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard let screen = statusItem.button?.window?.screen ?? NSScreen.main else { return }
+
+        // ฉากหลังสะอาด ๆ ใต้ทุกหน้าต่าง — กระจกจะได้เบลอสีสวย ๆ แทนหน้าจอที่กำลังใช้อยู่จริง
+        let backdrops: [NSWindow] = NSScreen.screens.map { target in
+            let backdrop = NSWindow(contentRect: target.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            backdrop.level = .normal
+            backdrop.isOpaque = true
+            backdrop.hasShadow = false
+            backdrop.collectionBehavior = [.canJoinAllSpaces, .stationary]
+            let gradient = NSView(frame: NSRect(origin: .zero, size: target.frame.size))
+            gradient.wantsLayer = true
+            let layer = CAGradientLayer()
+            layer.frame = gradient.bounds
+            layer.colors = [NSColor(red: 0.09, green: 0.12, blue: 0.24, alpha: 1).cgColor,
+                            NSColor(red: 0.28, green: 0.14, blue: 0.36, alpha: 1).cgColor,
+                            NSColor(red: 0.06, green: 0.25, blue: 0.34, alpha: 1).cgColor]
+            layer.startPoint = CGPoint(x: 0, y: 1); layer.endPoint = CGPoint(x: 1, y: 0)
+            gradient.layer?.addSublayer(layer)
+            backdrop.contentView = gradient
+            backdrop.orderFrontRegardless()
+            return backdrop
+        }
+        _ = screen
+
+        func save(_ name: String, _ rect: NSRect, pad: CGFloat) {
+            let padded = rect.insetBy(dx: -pad, dy: -pad)
+            guard let image = Thumbnails.captureScreen(Geometry.toCG(padded)) else { knackLog("shots: capture failed \(name)"); return }
+            if let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+                try? png.write(to: dir.appendingPathComponent(name + ".png"))
+            }
+        }
+        // แต่ละขั้น: ปิดของเดิม → รอ 0.5 วิ → เปิดของใหม่ → รอ 1.2 วิ → ถ่าย
+        typealias Step = (name: String, close: () -> Void, open: () -> NSRect?, pad: CGFloat)
+        let steps: [Step] = [
+            ("menubar", {}, { [self] in
+                guard let a = statusItem.button?.window.map({ $0.convertToScreen(statusItem.button!.convert(statusItem.button!.bounds, to: nil)) }) else { return nil }
+                let b = SystemMonitor.shared.screenFrame ?? a
+                return a.union(b).insetBy(dx: -12, dy: 0)
+            }, 0),
+            ("menu", {}, { [self] in toggleMenu(); return MenuPanel.shared.frame }, 28),
+            ("monitor", { MenuPanel.shared.dismiss() }, { SystemMonitor.shared.toggleDetails(); return MenuPanel.shared.frame }, 28),
+            ("arrange", { MenuPanel.shared.dismiss() }, { ArrangeDisplaysWindow.shared.present(); return ArrangeDisplaysWindow.shared.frame }, 28),
+            ("manual", { ArrangeDisplaysWindow.shared.orderOut(nil) }, { ManualWindow.shared.present(); return ManualWindow.shared.frame }, 28),
+            ("donate", { ManualWindow.shared.orderOut(nil) }, { DonateWindow.shared.present(); return DonateWindow.shared.frame }, 28),
+        ]
+        var delay = 0.3
+        for step in steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { step.close() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.5) {
+                guard let rect = step.open() else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { save(step.name, rect, pad: step.pad) }
+            }
+            delay += 2.2
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            DonateWindow.shared.orderOut(nil)
+            MenuPanel.shared.dismiss()
+            backdrops.forEach { $0.orderOut(nil) }
+            knackLog("shots: done → \(dir.path)")
+        }
     }
 
     /// คลิกไอคอน = เปิด/ปิดเมนูกระจกใต้ไอคอน
@@ -7254,7 +7228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(separator())
         menu.addItem(header("AI Usage"))
         menu.addItem(toggle("Claude Code Quota", .aiUsage,
-                            tip: "Your Claude Code quota on the menu bar, next to CPU/RAM: the current 5-hour window as a percentage, live from your Claude account (Keychain sign-in, asks once) with a local-log estimate as fallback. Click for weekly limits, tokens, cost and reset times"))
+                            tip: "Your Claude Code usage next to CPU/RAM: how much of the current 5-hour window you've used, estimated from Claude Code's own logs on this Mac — no account, nothing leaves your computer. Click for tokens, cost and reset time"))
 
         // ---- Display -------------------------------------------------------
         menu.addItem(separator())
