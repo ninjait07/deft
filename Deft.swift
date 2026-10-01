@@ -5166,6 +5166,14 @@ final class AIUsage {
     /// ค่าที่ช่องบนเมนูบาร์ใช้ — สัดส่วนของหน้าต่าง 5 ชม. ปัจจุบัน (ประมาณจาก log ในเครื่อง)
     var display: Double { snapshot.fraction }
     var isLive: Bool { snapshot.isLive }
+    /// เครื่องนี้มี Claude Code ไหม — ไม่มีก็ไม่ต้องโชว์ช่อง (0% ค้างบนเมนูบาร์ไม่มีความหมาย)
+    /// เช็กซ้ำทุกรอบสแกน ติดตั้งทีหลังเมื่อไหร่ช่องก็โผล่เอง
+    private(set) var available = AIUsage.detect()
+    /// ช่องควรขึ้นบนเมนูบาร์ไหม = ผู้ใช้เปิดสวิตช์ และเครื่องมี Claude Code
+    var showing: Bool { Config.aiUsage && available }
+    private static func detect() -> Bool {
+        FileManager.default.fileExists(atPath: claudeConfig.path) || FileManager.default.fileExists(atPath: root.path)
+    }
     private static let claudeConfig = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
 
     private static func readOfficial() -> Official? {
@@ -5220,6 +5228,11 @@ final class AIUsage {
 
     private func scan(force: Bool = false) {
         queue.async { [self] in
+            let found = Self.detect()
+            if found != available {
+                DispatchQueue.main.async { self.available = found; SystemMonitor.shared.refresh() }
+            }
+            guard found else { return }
             // รอบแรกต้องอ่าน log หลายร้อย MB — โชว์ตัวเลขทางการก่อนเลย ไม่ต้องรอ
             if offsets.isEmpty, let official = Self.readOfficial() {
                 let early = summarize([], official: official)
@@ -5607,7 +5620,7 @@ final class SystemMonitor: NSObject {
     private static let interval: TimeInterval = 2.0
 
     func refresh() {
-        if Config.monitorAny || Config.aiUsage { start() } else { stop() }
+        if Config.monitorAny || AIUsage.shared.showing { start() } else { stop() }
         if item != nil { layout(); tick() }   // เปลี่ยนชุดที่โชว์แล้ววาดใหม่ทันที
     }
 
@@ -5623,7 +5636,7 @@ final class SystemMonitor: NSObject {
     /// ความกว้างคงที่ตามจำนวนช่องที่เปิด ไม่ขึ้นกับตัวเลขข้างใน
     private func layout() {
         guard let item, let button = item.button else { return }
-        let count = [Config.monitorCPU, Config.monitorRAM, Config.monitorSSD, Config.aiUsage].filter { $0 }.count
+        let count = [Config.monitorCPU, Config.monitorRAM, Config.monitorSSD, AIUsage.shared.showing].filter { $0 }.count
         item.length = MonitorCellsView.width(for: count)
         cellsView.frame = button.bounds
         cellsView.autoresizingMask = [.width, .height]
@@ -5800,7 +5813,7 @@ final class SystemMonitor: NSObject {
         if Config.monitorCPU { result.append(.init(symbol: "cpu", percent: Int(sample.cpu.rounded()))) }
         if Config.monitorRAM { result.append(.init(symbol: "memorychip", percent: Self.percent(sample.ramUsed, sample.ramTotal))) }
         if Config.monitorSSD { result.append(.init(symbol: "internaldrive", percent: Int(sample.diskBusy.rounded()))) }
-        if Config.aiUsage {
+        if AIUsage.shared.showing {
             result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded()),
                                 prefix: AIUsage.shared.isLive ? "" : "≈"))
         }
@@ -5829,7 +5842,7 @@ final class SystemMonitor: NSObject {
             rows.append(MenuNoteRow("SSD  busy \(Int(s.diskBusy.rounded()))%   ↓ \(Self.rate(s.readRate))   ↑ \(Self.rate(s.writeRate))"))
             rows.append(MenuNoteRow("       used \(Self.gigabytes(s.diskUsed)) / \(Self.gigabytes(s.diskTotal))  (\(Self.percent(s.diskUsed, s.diskTotal))%)"))
         }
-        if Config.aiUsage {
+        if AIUsage.shared.showing {
             if !rows.isEmpty { rows.append(MenuSeparatorRow()) }
             rows.append(contentsOf: AIUsage.shared.detailRows())
         }
@@ -6016,8 +6029,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("AI Usage", "โควต้า AI", [
             ("Claude Code Quota",
-             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times, plus tokens and an approximate API-price cost. When Claude Code hasn't run for a while the value is marked ≈.",
-             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต token และค่าใช้จ่ายโดยประมาณตามราคา API ถ้าไม่ได้เปิด Claude Code มาสักพัก ตัวเลขจะมี ≈ นำหน้า"),
+             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times, plus tokens and an approximate API-price cost. When Claude Code hasn't run for a while the value is marked ≈. The cell only appears on Macs where Claude Code is installed — usage on claude.ai alone can't be shown, because Anthropic doesn't let other apps read it.",
+             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต token และค่าใช้จ่ายโดยประมาณตามราคา API ถ้าไม่ได้เปิด Claude Code มาสักพัก ตัวเลขจะมี ≈ นำหน้า ช่องนี้จะขึ้นเฉพาะเครื่องที่ติดตั้ง Claude Code เท่านั้น ถ้าใช้แค่ claude.ai บนเว็บจะแสดงไม่ได้ เพราะ Anthropic ไม่อนุญาตให้แอปอื่นอ่านข้อมูลนี้"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",
@@ -7409,8 +7422,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ---- AI Usage ------------------------------------------------------
         menu.addItem(separator())
         menu.addItem(header("AI Usage"))
-        menu.addItem(toggle("Claude Code Quota", .aiUsage,
-                            tip: "Your Claude Code quota next to CPU/RAM — the same session and weekly numbers /usage shows, read from the file Claude Code keeps on this Mac. No account, nothing leaves your computer. Click for limits and reset times"))
+        if AIUsage.shared.available {
+            menu.addItem(toggle("Claude Code Quota", .aiUsage,
+                                tip: "Your Claude Code quota next to CPU/RAM — the same session and weekly numbers /usage shows, read from the file Claude Code keeps on this Mac. No account, nothing leaves your computer. Click for limits and reset times"))
+        } else {
+            menu.addItem(note("Claude Code Quota appears once you use Claude Code on this Mac"))
+        }
 
         // ---- Display -------------------------------------------------------
         menu.addItem(separator())
