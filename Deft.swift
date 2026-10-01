@@ -123,9 +123,9 @@ enum Config {
     static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD }
     /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
     @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
-    /// เพดาน token ต่อหน้าต่าง 5 ชม. ที่ผู้ใช้ตั้งเอง (0 = อัตโนมัติจากหน้าต่างที่เคยหนักสุด)
-    @StoredNumber(key: "aiUsageLimit", fallback: 0)          static var aiUsageLimit: CGFloat
-    @StoredNumber(key: "aiUsageMaxSeen", fallback: 0)        static var aiUsageMaxSeen: CGFloat
+    /// ค่างาน ($ เทียบราคา API) ที่ถือเป็น 100% ของหน้าต่าง 5 ชม. — ได้จากการเทียบกับ /usage (0 = อัตโนมัติ)
+    @StoredNumber(key: "aiUsageLimitCost", fallback: 0)      static var aiUsageLimitCost: CGFloat
+    @StoredNumber(key: "aiUsageMaxCost", fallback: 0)        static var aiUsageMaxCost: CGFloat
 
     /// ย้ายค่าตั้งรุ่นเก่า: mouseScrollInvert (กลับทิศเทียบกับระบบ) → mouseNaturalScroll (ทิศที่อยากได้)
     static func migrate() {
@@ -142,7 +142,8 @@ enum Config {
         }
         // ฟีเจอร์แก้คำผิดแป้น (Convert Layout) ถอดออกแล้ว — ล้างค่าที่เคยเก็บไว้
         for key in ["layoutFix", "layoutFixAuto", "layoutFixUndoKey", "layoutFixIgnored", "layoutFixLearned",
-                    "perAppLanguage", "perAppLanguageMemory"] {
+                    "perAppLanguage", "perAppLanguageMemory",
+                    "aiUsageLimit", "aiUsageMaxSeen"] {   // เพดานแบบนับ token ดิบ (เลิกใช้ — ตอนนี้ถ่วงตามราคา)
             defaults.removeObject(forKey: key)
         }
         // สวิตช์ System Monitor ตัวเดียวรุ่นเก่า → สวิตช์แยกตามค่า
@@ -5075,19 +5076,36 @@ final class MenuActionRow: MenuRowView {
 final class AIUsage {
     static let shared = AIUsage()
 
+    /// ราคา API ต่อ 1 ล้าน token (input, output, cache read) — cache write คิด 1.25× (5 นาที) / 2× (1 ชม.) ของ input
+    /// โควต้าของแพลนสมัครสมาชิกคิดตามภาระงานจริง ไม่ใช่จำนวน token ดิบ — cache read ถูกกว่า input ปกติ 10–40 เท่า
+    /// ถ้านับ token ตรง ๆ บทสนทนายาว ๆ ที่อ่าน context เดิมซ้ำทุกเทิร์นจะทำให้ตัวเลขพุ่งเกินจริง จึงถ่วงน้ำหนักด้วยราคา
+    private static func price(_ model: String) -> (input: Double, output: Double, cacheRead: Double) {
+        switch model {
+        case let m where m.contains("fable-5-1"), let m where m.contains("mythos-5-1"): return (10, 50, 0.25)
+        case let m where m.contains("fable"), let m where m.contains("mythos"):         return (10, 50, 1.0)
+        case let m where m.contains("opus-5-5"):                                        return (4, 20, 0.20)
+        case let m where m.contains("opus-4-5"), let m where m.contains("opus-4-6"),
+             let m where m.contains("opus-4-7"), let m where m.contains("opus-4-8"),
+             let m where m.contains("opus-5"):                                          return (5, 25, 0.50)
+        case let m where m.contains("opus"):                                            return (15, 75, 1.5)   // Opus 4.1 และเก่ากว่า
+        case let m where m.contains("sonnet-5"):                                        return (2, 10, 0.20)
+        case let m where m.contains("sonnet"):                                          return (3, 15, 0.30)
+        case let m where m.contains("haiku"):                                           return (1, 5, 0.10)
+        default:                                                                        return (4, 20, 0.20)
+        }
+    }
+
     struct Entry {
         let time: Date
         let model: String
-        let input: Int, output: Int, cacheCreate: Int, cacheRead: Int
-        var total: Int { input + output + cacheCreate + cacheRead }
-        /// ค่าใช้จ่ายโดยประมาณตามราคา API (ผู้ใช้แบบเหมาจ่ายไม่ได้จ่ายจริง แค่ให้เห็นน้ำหนัก)
+        var input = 0, output = 0, cacheWrite5m = 0, cacheWrite1h = 0, cacheRead = 0
+        var total: Int { input + output + cacheWrite5m + cacheWrite1h + cacheRead }
+        /// ค่าใช้จ่ายเทียบราคา API (ผู้ใช้แบบเหมาจ่ายไม่ได้จ่ายจริง — ใช้เป็นน้ำหนักงาน)
         var cost: Double {
-            let (i, o): (Double, Double)
-            if model.contains("haiku") { (i, o) = (1.0, 5.0) }
-            else if model.contains("sonnet") { (i, o) = (3.0, 15.0) }
-            else { (i, o) = (15.0, 75.0) }                       // opus / fable / ไม่รู้จัก
-            return (Double(input) * i + Double(output) * o + Double(cacheCreate) * i * 1.25
-                    + Double(cacheRead) * i * 0.1) / 1_000_000
+            let p = AIUsage.price(model)
+            return (Double(input) * p.input + Double(output) * p.output
+                    + Double(cacheWrite5m) * p.input * 1.25 + Double(cacheWrite1h) * p.input * 2
+                    + Double(cacheRead) * p.cacheRead) / 1_000_000
         }
     }
 
@@ -5095,8 +5113,9 @@ final class AIUsage {
         let start: Date
         var end: Date { start.addingTimeInterval(5 * 3600) }
         var lastActivity: Date
-        var tokens = 0
         var cost = 0.0
+        var output = 0
+        var tokens = 0
         var isActive: Bool {
             let now = Date()
             return now < end && now.timeIntervalSince(lastActivity) < 5 * 3600
@@ -5105,20 +5124,23 @@ final class AIUsage {
 
     struct Snapshot {
         var current: Block?
-        var limit = 0                  // token ที่ถือเป็น 100% ของหน้าต่าง
-        var maxBlock = 0               // หน้าต่างที่เคยหนักสุด (ใช้เป็นเพดานอัตโนมัติ)
-        var todayTokens = 0, todayCost = 0.0
+        var limit = 0.0                // ค่างาน ($ เทียบ API) ที่ถือเป็น 100% ของหน้าต่าง
+        var maxBlock = 0.0             // หน้าต่างที่เคยหนักสุด (เพดานอัตโนมัติ ถ้ายังไม่ได้เทียบกับ /usage)
+        var todayTokens = 0, todayCost = 0.0, todayOutput = 0
+        var weekCost = 0.0
         var monthTokens = 0, monthCost = 0.0
         var scanned = false
         var fraction: Double {
             guard let current, current.isActive, limit > 0 else { return 0 }
-            return min(1, Double(current.tokens) / Double(limit))
+            return min(1, current.cost / limit)
         }
     }
     private(set) var snapshot = Snapshot()
 
-    private var entries: [Entry] = []
-    private var seen: Set<String> = []
+    /// ข้อความเดียวถูกเขียนหลายบรรทัดระหว่าง stream (ทีละ content block) และบรรทัดแรก ๆ ยังนับ output ไม่ครบ
+    /// เก็บตาม id แล้วใช้ค่าที่มากที่สุดของแต่ละช่อง — เคยนับแค่บรรทัดแรกทำให้ output หายไป ~10%
+    private var byID: [String: Entry] = [:]
+    private var anonymous: [Entry] = []
     private var offsets: [String: Int] = [:]          // path → byte ที่อ่านถึงแล้ว
     private let queue = DispatchQueue(label: "deft.aiusage", qos: .utility)
     private var timer: Timer?
@@ -5152,11 +5174,11 @@ final class AIUsage {
 
     // MARK: อ่าน log แบบต่อท้าย (ไฟล์ jsonl มีแต่เพิ่ม ไม่แก้ของเก่า)
 
-    private func scan() {
+    private func scan(force: Bool = false) {
         queue.async { [self] in
             guard let files = FileManager.default.enumerator(at: Self.root, includingPropertiesForKeys: [.fileSizeKey],
                                                              options: [.skipsHiddenFiles]) else { return }
-            var fresh: [Entry] = []
+            var changed = force
             for case let url as URL in files where url.pathExtension == "jsonl" {
                 let path = url.path
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -5170,17 +5192,26 @@ final class AIUsage {
                 offsets[path] = from + complete.count
                 guard let text = String(data: complete, encoding: .utf8) else { continue }
                 for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                    guard let entry = parse(line) else { continue }
-                    fresh.append(entry)
+                    guard let (id, entry) = parse(line) else { continue }
+                    changed = true
+                    guard let id else { anonymous.append(entry); continue }
+                    if var known = byID[id] {
+                        known.input = max(known.input, entry.input)
+                        known.output = max(known.output, entry.output)
+                        known.cacheWrite5m = max(known.cacheWrite5m, entry.cacheWrite5m)
+                        known.cacheWrite1h = max(known.cacheWrite1h, entry.cacheWrite1h)
+                        known.cacheRead = max(known.cacheRead, entry.cacheRead)
+                        byID[id] = known
+                    } else {
+                        byID[id] = entry
+                    }
                 }
             }
-            guard !fresh.isEmpty || !snapshot.scanned else { return }
+            guard changed || !snapshot.scanned else { return }
             let cutoff = Date().addingTimeInterval(-40 * 86400)
-            entries.append(contentsOf: fresh)
-            entries.removeAll { $0.time < cutoff }
-            entries.sort { $0.time < $1.time }
-            let next = summarize()
-            if !snapshot.scanned { knackLog("aiusage: \(entries.count) messages · window \(next.current.map { Self.tokens($0.tokens) } ?? "-") / limit \(Self.tokens(next.limit)) · today \(Self.tokens(next.todayTokens))") }
+            byID = byID.filter { $0.value.time >= cutoff }
+            anonymous.removeAll { $0.time < cutoff }
+            let next = summarize((Array(byID.values) + anonymous).sorted { $0.time < $1.time })
             DispatchQueue.main.async {
                 self.snapshot = next
                 self.push()
@@ -5189,15 +5220,15 @@ final class AIUsage {
     }
 
     /// ดึงเฉพาะฟิลด์ที่ต้องใช้ด้วยการหาข้อความตรง ๆ — เร็วกว่าแปลง JSON ทั้งบรรทัด (บรรทัดยาวเป็น 100KB ได้)
-    private func parse(_ line: Substring) -> Entry? {
+    private func parse(_ line: Substring) -> (String?, Entry)? {
         guard line.contains("\"type\":\"assistant\""), let usageAt = line.range(of: "\"usage\":{") else { return nil }
         func text(_ key: String, from: Substring.Index = line.startIndex) -> String? {
             guard let r = line.range(of: "\"\(key)\":\"", range: from..<line.endIndex) else { return nil }
             guard let end = line[r.upperBound...].firstIndex(of: "\"") else { return nil }
             return String(line[r.upperBound..<end])
         }
-        func number(_ key: String) -> Int {
-            guard let r = line.range(of: "\"\(key)\":", range: usageAt.upperBound..<line.endIndex) else { return 0 }
+        func number(_ key: String) -> Int? {
+            guard let r = line.range(of: "\"\(key)\":", range: usageAt.upperBound..<line.endIndex) else { return nil }
             var value = 0
             for ch in line[r.upperBound...] {
                 guard let d = ch.wholeNumberValue else { break }
@@ -5208,39 +5239,52 @@ final class AIUsage {
         guard let stamp = text("timestamp"),
               let time = Self.iso.date(from: stamp) ?? Self.isoPlain.date(from: stamp) else { return nil }
         let messageAt = line.range(of: "\"message\":{")?.upperBound ?? line.startIndex
-        let id = text("id", from: messageAt) ?? ""
+        let id = text("id", from: messageAt)
         let model = text("model", from: messageAt) ?? ""
         guard !model.isEmpty, model != "<synthetic>" else { return nil }
-        // ข้อความเดียวกันถูกเขียนซ้ำได้หลายบรรทัดระหว่าง stream — นับครั้งเดียวตาม id
-        if !id.isEmpty { if seen.contains(id) { return nil }; seen.insert(id) }
-        return Entry(time: time, model: model, input: number("input_tokens"), output: number("output_tokens"),
-                     cacheCreate: number("cache_creation_input_tokens"), cacheRead: number("cache_read_input_tokens"))
+        var e = Entry(time: time, model: model)
+        e.input = number("input_tokens") ?? 0
+        e.output = number("output_tokens") ?? 0
+        e.cacheRead = number("cache_read_input_tokens") ?? 0
+        let written = number("cache_creation_input_tokens") ?? 0
+        // แยก cache write ตามอายุ (1 ชม. แพงกว่า) — log รุ่นเก่าไม่มีรายละเอียด ถือเป็น 5 นาที
+        if let oneHour = number("ephemeral_1h_input_tokens") {
+            e.cacheWrite1h = min(oneHour, written)
+            e.cacheWrite5m = written - e.cacheWrite1h
+        } else {
+            e.cacheWrite5m = written
+        }
+        return (id, e)
     }
 
-    private func summarize() -> Snapshot {
+    private func summarize(_ entries: [Entry]) -> Snapshot {
         var s = Snapshot()
         s.scanned = true
         var blocks: [Block] = []
         var current: Block?
         let calendar = Calendar.current
+        let weekAgo = Date().addingTimeInterval(-7 * 86400)
         for e in entries {
+            let cost = e.cost
             if var b = current, e.time < b.end, e.time.timeIntervalSince(b.lastActivity) < 5 * 3600 {
-                b.tokens += e.total; b.cost += e.cost; b.lastActivity = e.time
+                b.cost += cost; b.output += e.output; b.tokens += e.total; b.lastActivity = e.time
                 current = b
             } else {
                 if let b = current { blocks.append(b) }
                 var start = calendar.dateComponents([.year, .month, .day, .hour], from: e.time)
                 start.minute = 0; start.second = 0
-                current = Block(start: calendar.date(from: start) ?? e.time, lastActivity: e.time, tokens: e.total, cost: e.cost)
+                current = Block(start: calendar.date(from: start) ?? e.time, lastActivity: e.time,
+                                cost: cost, output: e.output, tokens: e.total)
             }
-            if calendar.isDateInToday(e.time) { s.todayTokens += e.total; s.todayCost += e.cost }
-            if calendar.isDate(e.time, equalTo: Date(), toGranularity: .month) { s.monthTokens += e.total; s.monthCost += e.cost }
+            if calendar.isDateInToday(e.time) { s.todayTokens += e.total; s.todayCost += cost; s.todayOutput += e.output }
+            if e.time >= weekAgo { s.weekCost += cost }
+            if calendar.isDate(e.time, equalTo: Date(), toGranularity: .month) { s.monthTokens += e.total; s.monthCost += cost }
         }
         if let b = current { blocks.append(b) }
-        s.maxBlock = max(blocks.map(\.tokens).max() ?? 0, Int(Config.aiUsageMaxSeen))
-        if s.maxBlock > Int(Config.aiUsageMaxSeen) { Config.aiUsageMaxSeen = CGFloat(s.maxBlock) }
+        s.maxBlock = max(blocks.map(\.cost).max() ?? 0, Double(Config.aiUsageMaxCost))
+        if s.maxBlock > Double(Config.aiUsageMaxCost) { Config.aiUsageMaxCost = CGFloat(s.maxBlock) }
         s.current = blocks.last
-        s.limit = Config.aiUsageLimit > 0 ? Int(Config.aiUsageLimit) : max(s.maxBlock, 1)
+        s.limit = Config.aiUsageLimitCost > 0 ? Double(Config.aiUsageLimitCost) : max(s.maxBlock, 0.01)
         return s
     }
 
@@ -5258,49 +5302,62 @@ final class AIUsage {
     /// แถวรายละเอียดสำหรับแผงของ System Monitor (คลิกที่ช่องบนเมนูบาร์)
     func detailRows() -> [MenuRowView] {
         let s = snapshot
+        let calibrated = Config.aiUsageLimitCost > 0
         var rows: [MenuRowView] = []
-        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: "Estimate"))
+        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: calibrated ? "Calibrated" : "Estimate"))
         if !s.scanned {
             rows.append(MenuNoteRow("Reading usage logs…"))
         } else if let b = s.current, b.isActive {
             rows.append(UsageBarRow(percent: s.fraction, label: "Current window",
-                                    detail: "Resets in \(Self.countdown(to: b.end)) · \(Self.tokens(b.tokens)) / \(Self.tokens(s.limit)) tokens"))
+                                    detail: "Resets in \(Self.countdown(to: b.end)) · \(Self.tokens(b.output)) output tokens"))
         } else {
             rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
         }
         rows.append(MenuSeparatorRow())
         if let b = s.current, b.isActive {
-            rows.append(MenuNoteRow("This window   \(Self.tokens(b.tokens)) tokens   \(Self.money(b.cost))"))
+            rows.append(MenuNoteRow("This window   \(Self.money(b.cost))   ·   \(Self.tokens(b.output)) out"))
         }
-        rows.append(MenuNoteRow("Today   \(Self.tokens(s.todayTokens)) tokens   \(Self.money(s.todayCost))"))
-        rows.append(MenuNoteRow("This month   \(Self.tokens(s.monthTokens)) tokens   \(Self.money(s.monthCost))"))
+        rows.append(MenuNoteRow("Today   \(Self.money(s.todayCost))   ·   \(Self.tokens(s.todayOutput)) out"))
+        rows.append(MenuNoteRow("Last 7 days   \(Self.money(s.weekCost))"))
+        rows.append(MenuNoteRow("This month   \(Self.money(s.monthCost))"))
+        rows.append(MenuNoteRow("$ = API-price equivalent, not what your plan charges"))
         rows.append(MenuSeparatorRow())
-        let limitLabel = Config.aiUsageLimit > 0 ? "Limit: \(Self.tokens(Int(Config.aiUsageLimit))) (set by you)"
-                                                : "Limit: auto = heaviest window seen (\(Self.tokens(s.maxBlock)))"
-        rows.append(MenuNoteRow(limitLabel))
-        rows.append(MenuActionRow(title: "Set window limit…", symbolName: "slider.horizontal.3") { [weak self] in self?.askLimit() })
-        if Config.aiUsageLimit > 0 {
-            rows.append(MenuActionRow(title: "Back to auto limit", symbolName: "arrow.uturn.backward") { [weak self] in
-                Config.aiUsageLimit = 0; self?.scan()
+        rows.append(MenuNoteRow(calibrated ? "100% = \(Self.money(Double(Config.aiUsageLimitCost))) per window (matched to /usage)"
+                                           : "100% = heaviest window seen (\(Self.money(s.maxBlock))) — match /usage for accuracy"))
+        rows.append(MenuActionRow(title: "Match Claude Code's /usage…", symbolName: "scope") { [weak self] in self?.calibrate() })
+        if calibrated {
+            rows.append(MenuActionRow(title: "Back to auto", symbolName: "arrow.uturn.backward") { [weak self] in
+                Config.aiUsageLimitCost = 0; self?.scan(force: true)
             })
         }
         return rows
     }
 
-    private func askLimit() {
+    /// เทียบกับตัวเลขทางการ: ผู้ใช้พิมพ์ % ที่ /usage ใน Claude Code บอก → คำนวณเพดานของหน้าต่างจากค่างานตอนนี้
+    private func calibrate() {
+        guard let b = snapshot.current, b.isActive, b.cost > 0 else {
+            let alert = NSAlert()
+            alert.messageText = "Use Claude Code first"
+            alert.informativeText = "Calibration needs some usage in the current 5-hour window. Send a few messages in Claude Code, then try again."
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
+        }
         let alert = NSAlert()
-        alert.messageText = "Tokens per 5-hour window"
-        alert.informativeText = "Anthropic doesn't publish exact plan limits. Enter the number of tokens you consider 100% — e.g. 2000000 for 2M. Leave empty for auto (heaviest window seen)."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
-        field.placeholderString = "e.g. 2000000"
-        if Config.aiUsageLimit > 0 { field.stringValue = String(Int(Config.aiUsageLimit)) }
+        alert.messageText = "Match Claude Code's /usage"
+        alert.informativeText = "In Claude Code, run /usage and type the \"Current session\" percentage here. Deft will scale its estimate so it matches from now on."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
+        field.placeholderString = "e.g. 38"
         alert.accessoryView = field
-        alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Match"); alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let digits = field.stringValue.filter(\.isNumber)
-        Config.aiUsageLimit = CGFloat(Int(digits) ?? 0)
-        scan()
+        let text = field.stringValue.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
+        guard let percent = Double(text), percent > 0, percent <= 100 else { NSSound.beep(); return }
+        Config.aiUsageLimitCost = CGFloat(b.cost / (percent / 100))
+        knackLog("aiusage: calibrated \(percent)% at \(Self.money(b.cost)) → 100% = \(Self.money(Double(Config.aiUsageLimitCost)))")
+        scan(force: true)
     }
 }
 
