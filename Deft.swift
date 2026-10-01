@@ -5122,7 +5122,20 @@ final class AIUsage {
         }
     }
 
+    /// ตัวเลขทางการที่ Claude Code ดึงจาก Anthropic แล้วเก็บไว้ใน ~/.claude.json (ตัวเดียวกับที่ /usage แสดง)
+    /// อ่านไฟล์ในเครื่องเท่านั้น — ไม่แตะ token ล็อกอิน ไม่เรียก API
+    struct Official {
+        var session: Double                       // 0…1
+        var sessionResets: Date?
+        var weekly: Double?
+        var weeklyResets: Date?
+        var scoped: [(name: String, percent: Double, resets: Date?)] = []
+        var fetchedAt: Date
+    }
+
     struct Snapshot {
+        var official: Official?
+        var officialFraction: Double?             // ทางการ + งานที่เกิดใน log หลังจาก Claude Code อัปเดตครั้งล่าสุด
         var current: Block?
         var limit = 0.0                // ค่างาน ($ เทียบ API) ที่ถือเป็น 100% ของหน้าต่าง
         var maxBlock = 0.0             // หน้าต่างที่เคยหนักสุด (เพดานอัตโนมัติ ถ้ายังไม่ได้เทียบกับ /usage)
@@ -5131,8 +5144,14 @@ final class AIUsage {
         var monthTokens = 0, monthCost = 0.0
         var scanned = false
         var fraction: Double {
+            if let officialFraction { return officialFraction }
             guard let current, current.isActive, limit > 0 else { return 0 }
             return min(1, current.cost / limit)
+        }
+        /// ตัวเลขทางการยังสด (Claude Code อัปเดตภายใน 15 นาที) — ไม่ต้องใส่ ≈
+        var isLive: Bool {
+            guard let official, officialFraction != nil else { return false }
+            return Date().timeIntervalSince(official.fetchedAt) < 15 * 60
         }
     }
     private(set) var snapshot = Snapshot()
@@ -5146,6 +5165,31 @@ final class AIUsage {
     private var timer: Timer?
     /// ค่าที่ช่องบนเมนูบาร์ใช้ — สัดส่วนของหน้าต่าง 5 ชม. ปัจจุบัน (ประมาณจาก log ในเครื่อง)
     var display: Double { snapshot.fraction }
+    var isLive: Bool { snapshot.isLive }
+    private static let claudeConfig = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+
+    private static func readOfficial() -> Official? {
+        guard let data = try? Data(contentsOf: claudeConfig),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cached = root["cachedUsageUtilization"] as? [String: Any],
+              let fetched = cached["fetchedAtMs"] as? Double,
+              let u = cached["utilization"] as? [String: Any] else { return nil }
+        func date(_ any: Any?) -> Date? { (any as? String).flatMap { iso.date(from: $0) ?? isoPlain.date(from: $0) } }
+        func window(_ key: String) -> (Double, Date?)? {
+            guard let w = u[key] as? [String: Any], let pct = w["utilization"] as? Double else { return nil }
+            return (pct / 100, date(w["resets_at"]))
+        }
+        guard let five = window("five_hour") else { return nil }
+        var o = Official(session: five.0, sessionResets: five.1, fetchedAt: Date(timeIntervalSince1970: fetched / 1000))
+        if let week = window("seven_day") { o.weekly = week.0; o.weeklyResets = week.1 }
+        for limit in (u["limits"] as? [[String: Any]]) ?? [] where (limit["kind"] as? String) == "weekly_scoped" {
+            let scope = limit["scope"] as? [String: Any]
+            let model = (scope?["model"] as? [String: Any])?["display_name"] as? String
+            guard let name = model, let pct = limit["percent"] as? Double else { continue }
+            o.scoped.append((name, pct / 100, date(limit["resets_at"])))
+        }
+        return o
+    }
     private static let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
     private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
@@ -5176,6 +5220,11 @@ final class AIUsage {
 
     private func scan(force: Bool = false) {
         queue.async { [self] in
+            // รอบแรกต้องอ่าน log หลายร้อย MB — โชว์ตัวเลขทางการก่อนเลย ไม่ต้องรอ
+            if offsets.isEmpty, let official = Self.readOfficial() {
+                let early = summarize([], official: official)
+                DispatchQueue.main.async { if !self.snapshot.scanned || self.snapshot.official == nil { self.snapshot = early; self.push() } }
+            }
             guard let files = FileManager.default.enumerator(at: Self.root, includingPropertiesForKeys: [.fileSizeKey],
                                                              options: [.skipsHiddenFiles]) else { return }
             var changed = force
@@ -5207,11 +5256,13 @@ final class AIUsage {
                     }
                 }
             }
+            let official = Self.readOfficial()
+            if official?.fetchedAt != snapshot.official?.fetchedAt { changed = true }
             guard changed || !snapshot.scanned else { return }
             let cutoff = Date().addingTimeInterval(-40 * 86400)
             byID = byID.filter { $0.value.time >= cutoff }
             anonymous.removeAll { $0.time < cutoff }
-            let next = summarize((Array(byID.values) + anonymous).sorted { $0.time < $1.time })
+            let next = summarize((Array(byID.values) + anonymous).sorted { $0.time < $1.time }, official: official)
             DispatchQueue.main.async {
                 self.snapshot = next
                 self.push()
@@ -5257,9 +5308,10 @@ final class AIUsage {
         return (id, e)
     }
 
-    private func summarize(_ entries: [Entry]) -> Snapshot {
+    private func summarize(_ entries: [Entry], official: Official?) -> Snapshot {
         var s = Snapshot()
         s.scanned = true
+        s.official = official
         var blocks: [Block] = []
         var current: Block?
         let calendar = Calendar.current
@@ -5285,6 +5337,23 @@ final class AIUsage {
         if s.maxBlock > Double(Config.aiUsageMaxCost) { Config.aiUsageMaxCost = CGFloat(s.maxBlock) }
         s.current = blocks.last
         s.limit = Config.aiUsageLimitCost > 0 ? Double(Config.aiUsageLimitCost) : max(s.maxBlock, 0.01)
+
+        // หน้าต่างจริงตามที่ Anthropic บอก (เวลารีเซ็ต − 5 ชม.) — ไม่ต้องเดาจากต้นชั่วโมงของข้อความแรก
+        if let o = official, let resets = o.sessionResets, resets > Date() {
+            let start = resets.addingTimeInterval(-5 * 3600)
+            let inWindow = entries.filter { $0.time >= start }
+            let atFetch = inWindow.filter { $0.time <= o.fetchedAt }.reduce(0) { $0 + $1.cost }
+            let since = inWindow.filter { $0.time > o.fetchedAt }.reduce(0) { $0 + $1.cost }
+            // เรียนรู้ว่า 1% เท่ากับงานเท่าไหร่ จากตัวเลขทางการ (ใช้ตอน ≥ 10% ค่าที่ปัดเป็นจำนวนเต็มจะคลาดน้อย)
+            if o.session >= 0.10, atFetch > 0 { Config.aiUsageLimitCost = CGFloat(atFetch / o.session) }
+            let perUnit = Config.aiUsageLimitCost > 0 ? Double(Config.aiUsageLimitCost) : s.limit
+            s.officialFraction = min(1, o.session + since / max(perUnit, 0.01))
+            var b = Block(start: start, lastActivity: inWindow.last?.time ?? start)
+            for e in inWindow { b.cost += e.cost; b.output += e.output; b.tokens += e.total }
+            s.current = b
+        } else if let o = official, o.sessionResets == nil {
+            s.officialFraction = o.session
+        }
         return s
     }
 
@@ -5296,20 +5365,34 @@ final class AIUsage {
     private static func money(_ v: Double) -> String { String(format: "≈ $%.2f", v) }
     private static func countdown(to date: Date) -> String {
         let s = max(0, Int(date.timeIntervalSinceNow))
+        if s >= 86400 { return "\(s / 86400)d \((s % 86400) / 3600)h" }
         return s >= 3600 ? "\(s / 3600)h \((s % 3600) / 60)m" : "\(s / 60)m"
     }
 
     /// แถวรายละเอียดสำหรับแผงของ System Monitor (คลิกที่ช่องบนเมนูบาร์)
     func detailRows() -> [MenuRowView] {
         let s = snapshot
-        let calibrated = Config.aiUsageLimitCost > 0
         var rows: [MenuRowView] = []
-        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: calibrated ? "Calibrated" : "Estimate"))
+        rows.append(MenuHeaderLabelRow(symbol: "sparkles", text: "Claude Code", badge: s.isLive ? "Live" : "Estimate"))
         if !s.scanned {
-            rows.append(MenuNoteRow("Reading usage logs…"))
+            rows.append(MenuNoteRow("Reading usage…"))
+        } else if let o = s.official, s.officialFraction != nil {
+            rows.append(UsageBarRow(percent: s.fraction, label: "Current session",
+                                    detail: o.sessionResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "5-hour window"))
+            if let weekly = o.weekly {
+                rows.append(UsageBarRow(percent: weekly, label: "Weekly",
+                                        detail: o.weeklyResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
+            }
+            for scoped in o.scoped where scoped.percent > 0 {
+                rows.append(UsageBarRow(percent: scoped.percent, label: "\(scoped.name) weekly",
+                                        detail: scoped.resets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
+            }
+            let age = Int(Date().timeIntervalSince(o.fetchedAt) / 60)
+            rows.append(MenuNoteRow(age < 1 ? "From Claude Code's /usage, just now"
+                                            : "From Claude Code's /usage, \(age) min ago + activity since"))
         } else if let b = s.current, b.isActive {
-            rows.append(UsageBarRow(percent: s.fraction, label: "Current window",
-                                    detail: "Resets in \(Self.countdown(to: b.end)) · \(Self.tokens(b.output)) output tokens"))
+            rows.append(UsageBarRow(percent: s.fraction, label: "Current window ≈",
+                                    detail: "Resets in \(Self.countdown(to: b.end)) · open Claude Code for exact numbers"))
         } else {
             rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
         }
@@ -5318,47 +5401,11 @@ final class AIUsage {
             rows.append(MenuNoteRow("This window   \(Self.money(b.cost))   ·   \(Self.tokens(b.output)) out"))
         }
         rows.append(MenuNoteRow("Today   \(Self.money(s.todayCost))   ·   \(Self.tokens(s.todayOutput)) out"))
-        rows.append(MenuNoteRow("Last 7 days   \(Self.money(s.weekCost))"))
         rows.append(MenuNoteRow("This month   \(Self.money(s.monthCost))"))
         rows.append(MenuNoteRow("$ = API-price equivalent, not what your plan charges"))
-        rows.append(MenuSeparatorRow())
-        rows.append(MenuNoteRow(calibrated ? "100% = \(Self.money(Double(Config.aiUsageLimitCost))) per window (matched to /usage)"
-                                           : "100% = heaviest window seen (\(Self.money(s.maxBlock))) — match /usage for accuracy"))
-        rows.append(MenuActionRow(title: "Match Claude Code's /usage…", symbolName: "scope") { [weak self] in self?.calibrate() })
-        if calibrated {
-            rows.append(MenuActionRow(title: "Back to auto", symbolName: "arrow.uturn.backward") { [weak self] in
-                Config.aiUsageLimitCost = 0; self?.scan(force: true)
-            })
-        }
         return rows
     }
 
-    /// เทียบกับตัวเลขทางการ: ผู้ใช้พิมพ์ % ที่ /usage ใน Claude Code บอก → คำนวณเพดานของหน้าต่างจากค่างานตอนนี้
-    private func calibrate() {
-        guard let b = snapshot.current, b.isActive, b.cost > 0 else {
-            let alert = NSAlert()
-            alert.messageText = "Use Claude Code first"
-            alert.informativeText = "Calibration needs some usage in the current 5-hour window. Send a few messages in Claude Code, then try again."
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
-            return
-        }
-        let alert = NSAlert()
-        alert.messageText = "Match Claude Code's /usage"
-        alert.informativeText = "In Claude Code, run /usage and type the \"Current session\" percentage here. Deft will scale its estimate so it matches from now on."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
-        field.placeholderString = "e.g. 38"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Match"); alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let text = field.stringValue.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
-        guard let percent = Double(text), percent > 0, percent <= 100 else { NSSound.beep(); return }
-        Config.aiUsageLimitCost = CGFloat(b.cost / (percent / 100))
-        knackLog("aiusage: calibrated \(percent)% at \(Self.money(b.cost)) → 100% = \(Self.money(Double(Config.aiUsageLimitCost)))")
-        scan(force: true)
-    }
 }
 
 /// แถวแสดงโควต้าแบบแถบ: "50%  [Current]" / แถบ / "Resets in 1h 22m"
@@ -5754,7 +5801,8 @@ final class SystemMonitor: NSObject {
         if Config.monitorRAM { result.append(.init(symbol: "memorychip", percent: Self.percent(sample.ramUsed, sample.ramTotal))) }
         if Config.monitorSSD { result.append(.init(symbol: "internaldrive", percent: Int(sample.diskBusy.rounded()))) }
         if Config.aiUsage {
-            result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded())))
+            result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded()),
+                                prefix: AIUsage.shared.isLive ? "" : "≈"))
         }
         return result
     }
@@ -5968,8 +6016,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("AI Usage", "โควต้า AI", [
             ("Claude Code Quota",
-             "Shows your Claude Code usage on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour window you've used (orange → red as it fills). It's estimated from Claude Code's own logs on this Mac — no account to link and nothing leaves your computer. Anthropic doesn't publish exact plan limits, so 100% is the heaviest window you've ever used, or a limit you set. Click the cell for tokens used, an approximate cost at API prices, time until the window resets, and today's / this month's totals. For the official numbers, use /usage inside Claude Code.",
-             "แสดงการใช้งาน Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนของหน้าต่าง 5 ชั่วโมงปัจจุบันที่ใช้ไป (ส้ม → แดงเมื่อใกล้เต็ม) ประมาณจาก log ของ Claude Code ในเครื่องนี้เอง ไม่ต้องผูกบัญชีและไม่มีอะไรถูกส่งออกไป Anthropic ไม่ประกาศเพดานที่แน่นอน จึงถือหน้าต่างที่เคยใช้หนักสุดเป็น 100% หรือตั้งเพดานเองก็ได้ คลิกที่ช่องเพื่อดู token ที่ใช้ ค่าใช้จ่ายโดยประมาณตามราคา API เวลาที่เหลือก่อนรีเซ็ต และยอดรวมวันนี้/เดือนนี้ ตัวเลขทางการดูได้จาก /usage ใน Claude Code"),
+             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times, plus tokens and an approximate API-price cost. When Claude Code hasn't run for a while the value is marked ≈.",
+             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต token และค่าใช้จ่ายโดยประมาณตามราคา API ถ้าไม่ได้เปิด Claude Code มาสักพัก ตัวเลขจะมี ≈ นำหน้า"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",
@@ -7362,7 +7410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(separator())
         menu.addItem(header("AI Usage"))
         menu.addItem(toggle("Claude Code Quota", .aiUsage,
-                            tip: "Your Claude Code usage next to CPU/RAM: how much of the current 5-hour window you've used, estimated from Claude Code's own logs on this Mac — no account, nothing leaves your computer. Click for tokens, cost and reset time"))
+                            tip: "Your Claude Code quota next to CPU/RAM — the same session and weekly numbers /usage shows, read from the file Claude Code keeps on this Mac. No account, nothing leaves your computer. Click for limits and reset times"))
 
         // ---- Display -------------------------------------------------------
         menu.addItem(separator())

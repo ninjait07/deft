@@ -13,7 +13,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 - **Windows keyboard** — `Ctrl` acts as `Cmd`, the `Win` key, F-keys, Home/End, Explorer keys in Finder, a Windows-style language switch key, and auto-detection of Windows vs Mac keyboards.
 - **Mouse & scroll** — independent natural-scroll for mouse and trackpad, side-button back/forward, and `Ctrl`+scroll to zoom (sent as `⌘`+scroll to apps that zoom that way, `⌘+`/`⌘−` to the rest).
 - **System Monitor** — live CPU, RAM, and SSD cells in the menu bar with smooth animation; click for details.
-- **AI Usage** — a Claude Code cell next to CPU/RAM showing how much of the current 5-hour window you've used, estimated from Claude Code's local logs (no account, nothing leaves your Mac). Click for tokens, approximate cost, and reset time.
+- **AI Usage** — a Claude Code cell next to CPU/RAM with the same session and weekly percentages `/usage` shows, read from the file Claude Code keeps on your Mac (no account, nothing leaves your Mac). Click for weekly and per-model limits, reset times, tokens, and approximate cost.
 - **Display controls** — resolution, refresh rate, rotation, set main display, power a display off, and a drag-to-arrange window.
 - **Clean Keyboard** — lock every key so you can wipe the keyboard.
 - **Manual** — a built-in guide to every feature, in English and Thai.
