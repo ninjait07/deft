@@ -121,6 +121,8 @@ enum Config {
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
     @StoredBool(key: "monitorTemp", fallback: true)          static var monitorTemp: Bool
+    /// ความขุ่นของกระจกใต้ตัวหนังสือ (เมนู, Donate, Arrange Displays) — 0 = ใสสุด · 1 = เกือบทึบ
+    @StoredNumber(key: "glassOpacity", fallback: 0.5)        static var glassOpacity: CGFloat
     static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp }
     /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
     @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
@@ -1408,6 +1410,24 @@ enum GlassBackdrop {
         window.appearance = light ? NSAppearance(named: .darkAqua) : nil   // บนพื้นย้อมดำให้ตัวหนังสือขาว
         window.contentView?.needsDisplay = true
         window.contentView?.subviews.forEach { $0.needsDisplay = true }
+    }
+
+    /// ใช้ระดับความขุ่นที่ผู้ใช้ตั้งไว้กับกระจกแผ่นหนึ่ง
+    /// 0–0.1 = กระจกใส (Clear) ไม่ย้อม · มากกว่านั้น = กระจกฝ้า (Regular) ย้อมเข้มขึ้นเรื่อย ๆ จนเกือบทึบ
+    /// ย้อมตรงข้ามกับสีตัวหนังสือเสมอ (ตัวหนังสือขาว → ย้อมดำ) จึงยิ่งขุ่นยิ่งอ่านง่าย
+    @available(macOS 26.0, *)
+    static func applyPreference(to glass: NSGlassEffectView, dark: Bool) {
+        let v = Double(min(1, max(0, Config.glassOpacity)))
+        guard v >= 0.1 else { glass.style = .clear; glass.tintColor = nil; return }
+        glass.style = .regular
+        let alpha = 0.9 * (v - 0.1) / 0.9
+        glass.tintColor = alpha < 0.02 ? nil : (dark ? NSColor.black : NSColor.white).withAlphaComponent(alpha)
+    }
+
+    /// ใช้กับหน้าต่างที่ทั้งแผ่นเป็นกระจกใต้ตัวหนังสือ (Donate, Arrange Displays)
+    static func applyPreference(to window: NSWindow) {
+        guard #available(macOS 26.0, *), let glass = findGlass(in: window.contentView) else { return }
+        applyPreference(to: glass, dark: window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
     }
 
     @available(macOS 26.0, *)
@@ -4652,6 +4672,44 @@ class MenuRowView: NSView {
     }
 }
 
+/// แถบเลื่อนแบบ Control Center: ไอคอนซ้าย · แถบเลื่อนของระบบ (บน macOS 26 ได้ปุ่มแบบ Liquid Glass เอง) · ไอคอนขวา
+final class MenuSliderRow: MenuRowView {
+    private let slider: NSSlider
+    private let leftIcon = NSImageView(), rightIcon = NSImageView()
+    private let onChange: (Double) -> Void
+
+    init(value: Double, leftSymbol: String, rightSymbol: String, tip: String?, onChange: @escaping (Double) -> Void) {
+        self.onChange = onChange
+        slider = NSSlider(value: value, minValue: 0, maxValue: 1, target: nil, action: nil)
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 34))
+        slider.target = self
+        slider.action = #selector(changed)
+        slider.isContinuous = true
+        for (view, name) in [(leftIcon, leftSymbol), (rightIcon, rightSymbol)] {
+            view.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .medium))
+            view.contentTintColor = .secondaryLabelColor
+            addSubview(view)
+        }
+        addSubview(slider)
+        toolTip = tip
+        layoutParts()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var preferredWidth: CGFloat { 260 }
+    override func resize(to width: CGFloat) { super.resize(to: width); layoutParts() }
+
+    private func layoutParts() {
+        let mid = bounds.midY
+        leftIcon.frame = NSRect(x: 14, y: mid - 9, width: 18, height: 18)
+        rightIcon.frame = NSRect(x: bounds.width - 32, y: mid - 9, width: 18, height: 18)
+        slider.frame = NSRect(x: 40, y: mid - 11, width: bounds.width - 80, height: 22)
+    }
+
+    @objc private func changed() { onChange(slider.doubleValue) }
+}
+
 /// หัวเมนู — โลโก้ ชื่อแอป สถานะการทำงาน และปุ่ม Donate ทางขวา
 final class MenuHeaderView: MenuRowView {
     private let donate: () -> Void
@@ -6106,6 +6164,7 @@ final class DonateWindow: NSWindow {
         makeKeyAndOrderFront(nil)
         makeKey()   // ให้กระจกเรนเดอร์แบบ active ไม่ขุ่น
         GlassBackdrop.adaptToBackdrop(self)
+        GlassBackdrop.applyPreference(to: self)
     }
 
     @objc private func openSponsors() { NSWorkspace.shared.open(Sales.sponsorsURL) }
@@ -6193,6 +6252,11 @@ final class ManualWindow: NSWindow {
             ("Alt+Tab / Cmd+Tab",
              "In Windows mode, Alt+Tab (Option+Tab) cycles through windows. In Mac mode, Cmd+Tab does it when Live Preview is on. Hold the key and tap Tab to move; release to select.",
              "โหมด Windows ใช้ Alt+Tab (Option+Tab) สลับหน้าต่าง โหมด Mac ใช้ Cmd+Tab เมื่อเปิด Live Preview กดปุ่มค้างแล้วแตะ Tab เพื่อเลื่อน ปล่อยปุ่มเพื่อเลือก"),
+        ]),
+        ("Glass", "กระจก", [
+            ("Glass transparency",
+             "Drag the slider in the Glass section to choose how see-through Deft's glass is behind text — in the menu, the System Monitor details, Donate and Arrange Displays. All the way left is clear Liquid Glass; moving right frosts it and adds a tint that contrasts with the text, so it stays readable over busy or bright windows. The menu updates as you drag.",
+             "ลากแถบในหมวด Glass เพื่อเลือกว่ากระจกใต้ตัวหนังสือของ Deft จะใสแค่ไหน ทั้งในเมนู รายละเอียด System Monitor หน้าต่าง Donate และ Arrange Displays ซ้ายสุดคือ Liquid Glass แบบใส ยิ่งเลื่อนไปทางขวากระจกยิ่งขุ่นและย้อมสีตัดกับตัวหนังสือ อ่านง่ายแม้อยู่บนหน้าต่างที่รกหรือสว่าง เมนูเปลี่ยนตามทันทีระหว่างลาก"),
         ]),
         ("System", "ระบบ", [
             ("Open at Login",
@@ -7070,11 +7134,11 @@ final class MenuPanel: NSPanel {
 
     /// ย้อมการ์ดให้ตรงข้ามกับสีตัวหนังสือ: ตัวหนังสือขาว (ธีมมืด) → การ์ดเข้ม · ตัวหนังสือดำ → การ์ดอ่อน
     /// ดูจากธีมของเมนูอย่างเดียว ไม่ต้องวัดพื้นหลัง — ตัวหนังสือจึงตัดกับการ์ดเสมอ แม้ไม่มีสิทธิ์ Screen Recording
-    private func tintCards() {
+    /// ความเข้มของการย้อมมาจากแถบปรับความขุ่นในเมนู (Config.glassOpacity)
+    func tintCards() {
         guard #available(macOS 26.0, *) else { return }
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let tint = dark ? NSColor.black.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.45)
-        for case let glass as NSGlassEffectView in sectionCards { glass.tintColor = tint }
+        for case let glass as NSGlassEffectView in sectionCards { GlassBackdrop.applyPreference(to: glass, dark: dark) }
     }
 
     func present(rows: [MenuRowView], below anchor: NSRect, on screen: NSScreen) {
@@ -7479,7 +7543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// หัวข้อกลุ่มในเมนู — ตัวเล็กสีจาง คั่นของให้อ่านเป็นกลุ่มได้
     private static let sectionIcons: [String: String] = [
         "Windows": "macwindow", "Keyboard": "keyboard", "Mouse": "computermouse",
-        "System Monitor": "chart.bar.xaxis", "AI Usage": "sparkles", "Display": "display", "System": "gearshape"]
+        "System Monitor": "chart.bar.xaxis", "AI Usage": "sparkles", "Display": "display", "Glass": "circle.lefthalf.filled", "System": "gearshape"]
     private func header(_ text: String, badge: String? = nil) -> MenuRowView {
         MenuHeaderLabelRow(symbol: Self.sectionIcons[text] ?? "circle", text: text, badge: badge)
     }
@@ -7598,6 +7662,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ---- Display -------------------------------------------------------
         menu.addItem(separator())
         appendDisplaySection(into: menu)
+
+        // ---- Appearance ----------------------------------------------------
+        // ลากแล้วการ์ดในเมนูเปลี่ยนทันที ผู้ใช้เห็นผลตอนปรับ
+        menu.addItem(separator())
+        menu.addItem(header("Glass"))
+        menu.addItem(row(MenuSliderRow(value: Double(Config.glassOpacity), leftSymbol: "circle.dashed", rightSymbol: "circle.fill",
+                                       tip: "How see-through the glass behind text is. Left: clear like Liquid Glass. Right: frosted, easiest to read over busy backgrounds") { value in
+            Config.glassOpacity = CGFloat(value)
+            MenuPanel.shared.tintCards()
+        }))
 
         // ---- System --------------------------------------------------------
         menu.addItem(separator())
@@ -7862,6 +7936,7 @@ final class ArrangeDisplaysWindow: NSWindow {
         makeKeyAndOrderFront(nil)
         makeKey()   // ให้กระจกเรนเดอร์แบบ active ไม่ขุ่น
         GlassBackdrop.adaptToBackdrop(self)
+        GlassBackdrop.applyPreference(to: self)
         NSApp.activate(ignoringOtherApps: true)
     }
 

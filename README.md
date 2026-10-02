@@ -16,6 +16,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 - **AI Usage** — a Claude Code cell next to CPU/RAM with the same session and weekly percentages `/usage` shows, read from the file Claude Code keeps on your Mac (no account, nothing leaves your Mac). Click for weekly and per-model limits, reset times, tokens, and approximate cost.
 - **Display controls** — resolution, refresh rate, rotation, set main display, power a display off, and a drag-to-arrange window.
 - **Clean Keyboard** — lock every key so you can wipe the keyboard.
+- **Glass slider** — choose how see-through the menu and windows are, from clear Liquid Glass to frosted; the menu updates as you drag.
 - **Manual** — a built-in guide to every feature, in English and Thai.
 
 ## See it move
