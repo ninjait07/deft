@@ -120,7 +120,8 @@ enum Config {
     @StoredBool(key: "monitorCPU", fallback: true)           static var monitorCPU: Bool
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
-    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD }
+    @StoredBool(key: "monitorTemp", fallback: true)          static var monitorTemp: Bool
+    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp }
     /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
     @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
     /// ค่างาน ($ เทียบราคา API) ที่ถือเป็น 100% ของหน้าต่าง 5 ชม. — ได้จากการเทียบกับ /usage (0 = อัตโนมัติ)
@@ -3432,7 +3433,7 @@ enum MasterSwitch {
     case windowsSnap, livePreview
     case windowsShortcuts, autoKeyboard, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
-    case monitorCPU, monitorRAM, monitorSSD, aiUsage
+    case monitorCPU, monitorRAM, monitorSSD, monitorTemp, aiUsage
     case launchAtLogin
 
     var isOn: Bool {
@@ -3448,6 +3449,7 @@ enum MasterSwitch {
         case .monitorCPU:       return Config.monitorCPU
         case .monitorRAM:       return Config.monitorRAM
         case .monitorSSD:       return Config.monitorSSD
+        case .monitorTemp:      return Config.monitorTemp
         case .aiUsage:          return Config.aiUsage
         case .launchAtLogin:    return LoginItem.isEnabled
         }
@@ -3497,6 +3499,9 @@ enum MasterSwitch {
             SystemMonitor.shared.refresh()
         case .monitorSSD:
             Config.monitorSSD = value
+            SystemMonitor.shared.refresh()
+        case .monitorTemp:
+            Config.monitorTemp = value
             SystemMonitor.shared.refresh()
         case .aiUsage:
             Config.aiUsage = value
@@ -5351,8 +5356,9 @@ final class AIUsage {
         s.current = blocks.last
         s.limit = Config.aiUsageLimitCost > 0 ? Double(Config.aiUsageLimitCost) : max(s.maxBlock, 0.01)
 
-        // หน้าต่างจริงตามที่ Anthropic บอก (เวลารีเซ็ต − 5 ชม.) — ไม่ต้องเดาจากต้นชั่วโมงของข้อความแรก
-        if let o = official, let resets = o.sessionResets, resets > Date() {
+        guard let o = official else { return s }
+        if let resets = o.sessionResets, resets > Date() {
+            // หน้าต่างจริงตามที่ Anthropic บอก (เวลารีเซ็ต − 5 ชม.) — ไม่ต้องเดาจากต้นชั่วโมงของข้อความแรก
             let start = resets.addingTimeInterval(-5 * 3600)
             let inWindow = entries.filter { $0.time >= start }
             let atFetch = inWindow.filter { $0.time <= o.fetchedAt }.reduce(0) { $0 + $1.cost }
@@ -5364,8 +5370,25 @@ final class AIUsage {
             var b = Block(start: start, lastActivity: inWindow.last?.time ?? start)
             for e in inWindow { b.cost += e.cost; b.output += e.output; b.tokens += e.total }
             s.current = b
-        } else if let o = official, o.sessionResets == nil {
-            s.officialFraction = o.session
+        } else {
+            // ตอน Claude Code เช็กล่าสุดยังไม่มี session ที่ใช้อยู่ (หรือ session นั้นหมดไปแล้ว)
+            // และ Claude Code ไม่ได้เช็กซ้ำทุกครั้ง (เคยเงียบไป 50 นาทีระหว่างใช้งาน) — งานหลังจากนั้นคือหน้าต่างใหม่
+            // ที่เริ่มตอนข้อความแรก ประเมินเป็น % ด้วยอัตราที่เรียนรู้ไว้จากตัวเลขทางการ
+            let boundary = max(o.fetchedAt, o.sessionResets ?? .distantPast)
+            var window: Block?
+            for e in entries where e.time > boundary {
+                if window == nil || e.time >= window!.end { window = Block(start: e.time, lastActivity: e.time) }
+                window!.cost += e.cost; window!.output += e.output; window!.tokens += e.total
+                window!.lastActivity = e.time
+            }
+            let perUnit = Config.aiUsageLimitCost > 0 ? Double(Config.aiUsageLimitCost) : s.limit
+            if let b = window, b.isActive {
+                s.officialFraction = min(1, b.cost / max(perUnit, 0.01))
+                s.current = b
+            } else {
+                s.officialFraction = 0
+                s.current = nil
+            }
         }
         return s
     }
@@ -5390,8 +5413,11 @@ final class AIUsage {
         if !s.scanned {
             rows.append(MenuNoteRow("Reading usage…"))
         } else if let o = s.official, s.officialFraction != nil {
-            rows.append(UsageBarRow(percent: s.fraction, label: "Current session",
-                                    detail: o.sessionResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "5-hour window"))
+            let detail: String
+            if let resets = o.sessionResets, resets > Date() { detail = "Resets in \(Self.countdown(to: resets))" }
+            else if let b = s.current, b.isActive { detail = "Resets in about \(Self.countdown(to: b.end))" }
+            else { detail = "No active session — starts with your next message" }
+            rows.append(UsageBarRow(percent: s.fraction, label: "Current session", detail: detail))
             if let weekly = o.weekly {
                 rows.append(UsageBarRow(percent: weekly, label: "Weekly",
                                         detail: o.weeklyResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
@@ -5472,6 +5498,7 @@ final class MonitorCellsView: NSView {
         var symbol: String          // ชื่อ SF Symbol หรือ "claude" = วาดโลโก้ Claude เอง
         var percent: Int
         var prefix = ""             // "≈" ตอนเป็นค่าประมาณ
+        var celsius = false         // แสดงเป็นองศา (percent = Thermal.percent ของอุณหภูมิ)
     }
     static let claudeBrand = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)   // ส้มของ Claude
 
@@ -5589,10 +5616,95 @@ final class MonitorCellsView: NSView {
                 icon.draw(in: NSRect(x: rect.minX + 5, y: rect.midY - size.height / 2,
                                      width: size.width, height: size.height))
             }
-            let value = NSAttributedString(string: cell.prefix + "\(level)%", attributes: [
+            let shown = cell.celsius ? "\(Int(Thermal.celsius(fromPercent: smooth).rounded()))°" : "\(level)%"
+            let value = NSAttributedString(string: cell.prefix + shown, attributes: [
                 .font: Self.valueFont, .foregroundColor: level >= 85 ? NSColor.systemRed : NSColor.labelColor])
             let valueSize = value.size()
             value.draw(at: NSPoint(x: rect.maxX - 5 - valueSize.width, y: rect.midY - valueSize.height / 2))
+        }
+    }
+}
+
+// MARK: - อุณหภูมิจากเซ็นเซอร์ของชิป ---------------------------------------------------
+
+/// macOS ไม่มี API สาธารณะที่ให้อุณหภูมิเป็น °C — ProcessInfo.thermalState บอกแค่ 4 ระดับ
+/// ชิป Apple Silicon รายงานเซ็นเซอร์ผ่าน IOHIDEventSystem (ทางเดียวกับที่ Stats / iStat Menus ใช้)
+/// อ่านอย่างเดียว ไม่ต้องสิทธิ์ admin ไม่ต้องขอ permission เพิ่ม
+@_silgen_name("IOHIDEventSystemClientCreate")
+fileprivate func IOHIDEventSystemClientCreate(_ allocator: CFAllocator?) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDEventSystemClientSetMatching")
+fileprivate func IOHIDEventSystemClientSetMatching(_ client: AnyObject, _ matching: CFDictionary) -> Int32
+@_silgen_name("IOHIDEventSystemClientCopyServices")
+fileprivate func IOHIDEventSystemClientCopyServices(_ client: AnyObject) -> Unmanaged<CFArray>?
+@_silgen_name("IOHIDServiceClientCopyProperty")
+fileprivate func IOHIDServiceClientCopyProperty(_ service: AnyObject, _ key: CFString) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDServiceClientCopyEvent")
+fileprivate func IOHIDServiceClientCopyEvent(_ service: AnyObject, _ type: Int64, _ options: Int32, _ timestamp: Int64) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDEventGetFloatValue")
+fileprivate func IOHIDEventGetFloatValue(_ event: AnyObject, _ field: Int32) -> Double
+
+enum Thermal {
+    struct Reading {
+        var cpuMax: Double?, cpuAvg: Double?
+        var ssd: Double?
+        var battery: Double?
+    }
+    private enum Kind { case cpu, ssd, battery }
+
+    private static let eventType: Int64 = 15                 // kIOHIDEventTypeTemperature
+    private static let field: Int32 = 15 << 16               // kIOHIDEventFieldTemperatureLevel
+    /// รายชื่อเซ็นเซอร์ที่ใช้ได้ หาครั้งเดียวตอนอ่านครั้งแรก
+    /// "PMU tdie*" = อุณหภูมิของ die ซีพียู · "NAND" = SSD · "gas gauge battery" = แบตเตอรี่
+    /// (tcal เป็นค่าคาลิเบรต และ tdev บนบางชิปตอบค่าติดลบหลักพัน จึงไม่ใช้)
+    /// ต้องเก็บ client ไว้ตลอดอายุแอป — service ที่ได้มาเป็นของ client ตัวนี้ ถ้าปล่อย client ทิ้ง
+    /// service จะชี้ไปหน่วยความจำที่ถูกคืนแล้ว (เคยทำให้แอปพังไปโผล่ที่จุดอื่น)
+    private static let client: AnyObject? = IOHIDEventSystemClientCreate(kCFAllocatorDefault)?.takeRetainedValue()
+    private static let sensors: [(Kind, AnyObject)] = {
+        guard let client else { return [] }
+        _ = IOHIDEventSystemClientSetMatching(client, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+        guard let services = IOHIDEventSystemClientCopyServices(client)?.takeRetainedValue() as? [AnyObject] else { return [] }
+        return services.compactMap { service in
+            guard let name = IOHIDServiceClientCopyProperty(service, "Product" as CFString)?.takeRetainedValue() as? String
+            else { return nil }
+            if name.hasPrefix("PMU tdie") { return (.cpu, service) }
+            if name.contains("NAND") { return (.ssd, service) }
+            if name.localizedCaseInsensitiveContains("battery") { return (.battery, service) }
+            return nil
+        }
+    }()
+
+    static var available: Bool { sensors.contains { $0.0 == .cpu } }
+
+    static func read() -> Reading? {
+        guard available else { return nil }
+        var cpu: [Double] = [], ssd: [Double] = [], battery: [Double] = []
+        for (kind, service) in sensors {
+            guard let event = IOHIDServiceClientCopyEvent(service, eventType, 0, 0)?.takeRetainedValue() else { continue }
+            let value = IOHIDEventGetFloatValue(event, field)
+            guard value > 0, value < 150 else { continue }     // ค่าเพี้ยน/ยังไม่พร้อม
+            switch kind {
+            case .cpu: cpu.append(value)
+            case .ssd: ssd.append(value)
+            case .battery: battery.append(value)
+            }
+        }
+        guard !cpu.isEmpty else { return nil }
+        return Reading(cpuMax: cpu.max(), cpuAvg: cpu.reduce(0, +) / Double(cpu.count),
+                       ssd: ssd.max(), battery: battery.max())
+    }
+
+    /// แปลงอุณหภูมิเป็นความยาวแถบ: 25°C = ว่าง · 105°C = เต็ม (ชิปเริ่มลดความเร็วตัวเองแถว ๆ 100°C)
+    /// ตรงกับเกณฑ์สีของช่อง: 70% ≈ 81°C เริ่มส้ม · 85% ≈ 93°C แดงและกระพริบเตือน
+    static func percent(fromCelsius c: Double) -> Int { Int(min(100, max(0, (c - 25) / 0.8)).rounded()) }
+    static func celsius(fromPercent p: Double) -> Double { 25 + p * 0.8 }
+
+    static var stateName: String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  return "Normal"
+        case .fair:     return "Warm"
+        case .serious:  return "Hot — macOS may slow the chip down"
+        case .critical: return "Critical — macOS is throttling"
+        @unknown default: return "Unknown"
         }
     }
 }
@@ -5608,6 +5720,7 @@ final class SystemMonitor: NSObject {
         var diskBusy: Double = 0                  // 0–100 สัดส่วนเวลาที่ดิสก์ยุ่ง (แบบ iostat %util)
         var readRate: Double = 0, writeRate: Double = 0   // bytes/s
         var diskUsed: Int64 = 0, diskTotal: Int64 = 0     // ความจุ ใช้แค่ในเมนูรายละเอียด
+        var temp: Thermal.Reading?
     }
     private(set) var sample = Sample()
 
@@ -5636,7 +5749,8 @@ final class SystemMonitor: NSObject {
     /// ความกว้างคงที่ตามจำนวนช่องที่เปิด ไม่ขึ้นกับตัวเลขข้างใน
     private func layout() {
         guard let item, let button = item.button else { return }
-        let count = [Config.monitorCPU, Config.monitorRAM, Config.monitorSSD, AIUsage.shared.showing].filter { $0 }.count
+        let count = [Config.monitorCPU, Config.monitorRAM, Config.monitorSSD, Config.monitorTemp && Thermal.available,
+                     AIUsage.shared.showing].filter { $0 }.count
         item.length = MonitorCellsView.width(for: count)
         cellsView.frame = button.bounds
         cellsView.autoresizingMask = [.width, .height]
@@ -5714,6 +5828,8 @@ final class SystemMonitor: NSObject {
                 lastDisk = (stats.perDrive, stats.read, stats.write, at)
             }
         }
+
+        if Config.monitorTemp { next.temp = Thermal.read() }
 
         sample = next
         cellsView.cells = cells()
@@ -5813,6 +5929,12 @@ final class SystemMonitor: NSObject {
         if Config.monitorCPU { result.append(.init(symbol: "cpu", percent: Int(sample.cpu.rounded()))) }
         if Config.monitorRAM { result.append(.init(symbol: "memorychip", percent: Self.percent(sample.ramUsed, sample.ramTotal))) }
         if Config.monitorSSD { result.append(.init(symbol: "internaldrive", percent: Int(sample.diskBusy.rounded()))) }
+        if Config.monitorTemp, let hottest = sample.temp?.cpuMax {
+            var level = Thermal.percent(fromCelsius: hottest)
+            // ระบบบอกว่าร้อนจนต้องลดความเร็ว → เตือนเป็นสีแดงไว้ก่อนไม่ว่าตัวเลขจะเท่าไหร่
+            if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { level = max(level, 85) }
+            result.append(.init(symbol: "thermometer.medium", percent: level, celsius: true))
+        }
         if AIUsage.shared.showing {
             result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded()),
                                 prefix: AIUsage.shared.isLive ? "" : "≈"))
@@ -5842,6 +5964,16 @@ final class SystemMonitor: NSObject {
             rows.append(MenuNoteRow("SSD  busy \(Int(s.diskBusy.rounded()))%   ↓ \(Self.rate(s.readRate))   ↑ \(Self.rate(s.writeRate))"))
             rows.append(MenuNoteRow("       used \(Self.gigabytes(s.diskUsed)) / \(Self.gigabytes(s.diskTotal))  (\(Self.percent(s.diskUsed, s.diskTotal))%)"))
         }
+        if Config.monitorTemp, let t = s.temp {
+            var parts: [String] = []
+            if let c = t.cpuMax { parts.append("CPU \(Int(c.rounded()))°C") }
+            if let c = t.ssd { parts.append("SSD \(Int(c.rounded()))°C") }
+            if let c = t.battery { parts.append("Battery \(Int(c.rounded()))°C") }
+            rows.append(MenuNoteRow("Temp  " + parts.joined(separator: "   ")))
+            if let avg = t.cpuAvg {
+                rows.append(MenuNoteRow("       CPU average \(Int(avg.rounded()))°C  ·  \(Thermal.stateName)"))
+            }
+        }
         if AIUsage.shared.showing {
             if !rows.isEmpty { rows.append(MenuSeparatorRow()) }
             rows.append(contentsOf: AIUsage.shared.detailRows())
@@ -5865,6 +5997,7 @@ final class SystemMonitor: NSObject {
         MasterSwitch.monitorCPU.set(false)
         MasterSwitch.monitorRAM.set(false)
         MasterSwitch.monitorSSD.set(false)
+        MasterSwitch.monitorTemp.set(false)
         MasterSwitch.aiUsage.set(false)
         AppDelegate.shared?.refreshMenu()
     }
@@ -6044,9 +6177,9 @@ final class ManualWindow: NSWindow {
              "ปุ่มข้าง 4 และ 5 ทำหน้าที่ย้อนกลับ/ไปข้างหน้า (Cmd+[ / Cmd+])"),
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
-            ("CPU · RAM · SSD",
-             "Shows live CPU load, memory in use, and disk activity right in the menu bar. Toggle each independently; click a cell for details.",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ และการทำงานของดิสก์สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด"),
+            ("CPU · RAM · SSD · Temperature",
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). The details also show SSD and battery temperatures and macOS's thermal state.",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) ในรายละเอียดมีอุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบด้วย"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
@@ -7418,6 +7551,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             tip: "Memory used (app + wired + compressed), as Activity Monitor counts it"))
         menu.addItem(toggle("SSD", .monitorSSD,
                             tip: "Disk activity (share of time busy reading/writing, as iostat measures it). Click for speed and capacity"))
+        if Thermal.available {
+            menu.addItem(toggle("Temperature", .monitorTemp,
+                                tip: "Hottest CPU core in °C, read from the chip's own sensors. Turns orange above ~81°C and red above ~93°C. Click for SSD and battery temperatures"))
+        }
 
         // ---- AI Usage ------------------------------------------------------
         menu.addItem(separator())
