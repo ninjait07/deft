@@ -22,8 +22,8 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="${KNACK_APP:-$HOME/Applications/Deft.app}"
 NAME="${KNACK_NAME:-Deft}"
 BUNDLE_ID="${KNACK_BUNDLE_ID:-com.nonbannawat.deft}"
-VERSION="${KNACK_VERSION:-1.3.1}"
-BUILD="${KNACK_BUILD:-5}"
+VERSION="${KNACK_VERSION:-1.3.2}"
+BUILD="${KNACK_BUILD:-6}"
 
 # ---- เลือก signing identity -------------------------------------------------
 pick_identity() {
