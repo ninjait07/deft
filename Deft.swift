@@ -6090,7 +6090,7 @@ final class DonateWindow: NSWindow {
             qr.widthAnchor.constraint(equalToConstant: 244),
             qr.heightAnchor.constraint(equalToConstant: 244),
         ])
-        contentView = GlassBackdrop.wrap(container, cornerRadius: 22, frosted: false)
+        contentView = GlassBackdrop.wrap(container, cornerRadius: 22, frosted: true)   // Regular = อ่านออกบนพื้นทุกแบบ
     }
 
     override var canBecomeKey: Bool { true }
@@ -7010,26 +7010,37 @@ final class MenuPanel: NSPanel {
             row.setFrameOrigin(NSPoint(x: 0, y: y))
         }
 
-        // การ์ดใต้แต่ละหมวด — เริ่มที่หัวหมวด ยาวถึงแถวสุดท้ายก่อนหมวดถัดไป (วางไว้ข้างหลังแถว)
+        // การ์ดกระจกฝ้าใต้แต่ละกลุ่ม — เบลอสิ่งที่อยู่ข้างหลังจนตัวหนังสืออ่านออกบนพื้นทุกแบบ
+        // (เคยเป็นแค่สีโปร่งแสงบนกระจกใส ผู้ใช้เจอแท็บ Chrome / รายการไฟล์ทะลุมาชนตัวหนังสือจนอ่านไม่ออก)
+        // ขอบนอกยังเป็นกระจกใสเหมือนเดิม · การ์ดเปลี่ยนสีตามธีมเอง ไม่ต้องพึ่งสิทธิ์ Screen Recording
+        // หมวด = ตั้งแต่หัวหมวดถึงแถวสุดท้ายก่อนหมวดถัดไป · แถวนอกหมวด (หัวเมนู, เครดิตท้าย,
+        // ตัวเลข CPU/RAM ในแผงรายละเอียด) ได้การ์ดของตัวเองตามช่วงที่คั่นด้วยช่องว่าง
         sectionCards.removeAll()
         let inset: CGFloat = 6
+        var groups: [(first: Int, last: Int)] = []
         var i = 0
         while i < rows.count {
-            guard rows[i] is MenuHeaderLabelRow else { i += 1; continue }
+            if rows[i] is MenuSeparatorRow { i += 1; continue }
             var j = i + 1, last = i
-            while j < rows.count, !(rows[j] is MenuHeaderLabelRow) {
-                if !(rows[j] is MenuSeparatorRow), !(rows[j] is MenuFooterRow) { last = j }
-                j += 1
+            if rows[i] is MenuHeaderLabelRow {
+                while j < rows.count, !(rows[j] is MenuHeaderLabelRow), !(rows[j] is MenuFooterRow) {
+                    if !(rows[j] is MenuSeparatorRow) { last = j }
+                    j += 1
+                }
+            } else {
+                while j < rows.count, !(rows[j] is MenuSeparatorRow), !(rows[j] is MenuHeaderLabelRow) {
+                    last = j; j += 1
+                }
             }
-            let topY = rows[i].frame.maxY, botY = rows[last].frame.minY
-            let card = NSView(frame: NSRect(x: inset, y: botY - 3,
-                                            width: width - inset * 2, height: topY - botY + 6))
-            card.wantsLayer = true
-            card.layer?.cornerRadius = 12
-            card.layer?.borderWidth = 1
+            groups.append((i, last))
+            i = j
+        }
+        for group in groups {
+            let topY = rows[group.first].frame.maxY, botY = rows[group.last].frame.minY
+            let frame = NSRect(x: inset, y: botY - 3, width: width - inset * 2, height: topY - botY + 6)
+            let card = Self.readableCard(frame: frame)
             container.addSubview(card)
             sectionCards.append(card)
-            i = j
         }
         // แถวจริงวางทับการ์ด
         for row in rows { container.addSubview(row) }
@@ -7037,15 +7048,33 @@ final class MenuPanel: NSPanel {
         return NSSize(width: width, height: height)
     }
 
-    /// ย้อมสีการ์ดตามพื้นหลัง: พื้นสว่าง = การ์ดเข้ม  ·  พื้นมืด = การ์ดสว่าง (ให้ขุ่นเห็นชัดทั้งสองแบบ)
-    private func tintCards() {
-        let light = (Thumbnails.backdropLuminance(below: self) ?? 0) > 0.5
-        let fill = light ? NSColor.black.withAlphaComponent(0.20) : NSColor.white.withAlphaComponent(0.16)
-        let border = light ? NSColor.black.withAlphaComponent(0.14) : NSColor.white.withAlphaComponent(0.14)
-        for card in sectionCards {
-            card.layer?.backgroundColor = fill.cgColor
-            card.layer?.borderColor = border.cgColor
+    /// การ์ดใต้ตัวหนังสือ — แบบเดียวกับปุ่มใน Control Center: Liquid Glass แบบ Regular
+    /// (เบลอพื้นหลังและระบบปรับความเข้มให้เองตามสิ่งที่อยู่ข้างหลัง ไม่ต้องพึ่งสิทธิ์ Screen Recording)
+    /// macOS ก่อน 26 ใช้กระจกฝ้าแบบเดิมแทน
+    static func readableCard(frame: NSRect, cornerRadius: CGFloat = 12) -> NSView {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: frame)
+            glass.style = .regular
+            glass.cornerRadius = cornerRadius
+            return glass
         }
+        let card = NSVisualEffectView(frame: frame)
+        card.material = .menu
+        card.blendingMode = .behindWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = cornerRadius
+        card.layer?.masksToBounds = true
+        return card
+    }
+
+    /// ย้อมการ์ดให้ตรงข้ามกับสีตัวหนังสือ: ตัวหนังสือขาว (ธีมมืด) → การ์ดเข้ม · ตัวหนังสือดำ → การ์ดอ่อน
+    /// ดูจากธีมของเมนูอย่างเดียว ไม่ต้องวัดพื้นหลัง — ตัวหนังสือจึงตัดกับการ์ดเสมอ แม้ไม่มีสิทธิ์ Screen Recording
+    private func tintCards() {
+        guard #available(macOS 26.0, *) else { return }
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let tint = dark ? NSColor.black.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.45)
+        for case let glass as NSGlassEffectView in sectionCards { glass.tintColor = tint }
     }
 
     func present(rows: [MenuRowView], below anchor: NSRect, on screen: NSScreen) {
@@ -7818,7 +7847,7 @@ final class ArrangeDisplaysWindow: NSWindow {
             buttons.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
             buttons.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18),
         ])
-        contentView = GlassBackdrop.wrap(container, cornerRadius: 22, frosted: false)
+        contentView = GlassBackdrop.wrap(container, cornerRadius: 22, frosted: true)   // Regular = อ่านออกบนพื้นทุกแบบ
     }
 
     override var canBecomeKey: Bool { true }
