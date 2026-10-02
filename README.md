@@ -2,6 +2,9 @@
 
 **Give your Mac the Windows habits you miss — free, native, and open source.**
 
+[![Download](https://img.shields.io/github/v/release/ninjait07/deft?label=Download&color=2f7de0)](https://github.com/ninjait07/deft/releases/latest)
+[![Follow NonDev on Facebook](https://img.shields.io/badge/Facebook-NonDev-1877F2?logo=facebook&logoColor=white)](https://www.facebook.com/nondev07/)
+
 Deft is a lightweight macOS menu-bar app that brings the window-management and keyboard behaviour of Windows to your Mac, without changing anything permanently.
 
 <p align="center"><img src="docs/img/menu.png" width="360" alt="Deft menu"></p>
@@ -77,6 +80,10 @@ KNACK_VERSION=1.0 KNACK_BUILD=1 ./release.sh 1.0 1   # notarized release dmg
 ```
 
 Requires macOS 13+, Xcode command-line tools, and a Developer ID for signing/notarizing. The whole app is a single Swift file: `Deft.swift`.
+
+## Follow
+
+Updates, demos and new projects are posted on the **[NonDev Facebook page](https://www.facebook.com/nondev07/)** — follow along, ask questions, or suggest features there.
 
 ## Support
 
