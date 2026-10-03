@@ -3011,6 +3011,72 @@ enum FinderBridge {
     /// คลิปบอร์ดเปลี่ยนหลังจากนั้น (ก๊อปอย่างอื่น) = ยกเลิกการตัด วางแล้วเป็นการก๊อปตามปกติ
     static var cutPending = false
     static var cutChangeCount = -1
+    private static var cutWatch = 0
+
+    /// หลังสั่ง ⌘C: รอ Finder ก๊อปเสร็จ (ปกติไม่ถึง 0.1 วิ) — คลิปบอร์ดขยับ = ตัดติด เล่นเสียงทันที
+    /// ไม่ขยับภายใน 0.3 วิ = ไม่ได้เลือกไฟล์ไว้ ไม่นับว่าตัด · รอบสุดท้ายเก็บเลขคลิปบอร์ดล่าสุดไว้เทียบตอนวาง
+    static func watchCut(since before: Int) {
+        cutWatch += 1
+        let token = cutWatch
+        cutPending = false
+        var played = false
+        for step in 1...10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03 * Double(step)) {
+                guard token == cutWatch else { return }
+                let now = NSPasteboard.general.changeCount
+                guard now != before else { return }
+                cutPending = true
+                cutChangeCount = now
+                if !played { played = true; playCutSound() }
+            }
+        }
+    }
+
+    /// เสียง "แกร็ก" นุ่ม ๆ สั้น ๆ บอกว่าตัดแล้ว — Finder ไม่มีอะไรให้เห็นว่าไฟล์ถูกตัด (Explorer ทำไอคอนจาง)
+    /// ปิดตามสวิตช์ "Play user interface sound effects" ของระบบ
+    private static func playCutSound() {
+        if let enabled = UserDefaults.standard.object(forKey: "com.apple.sound.uiaudio.enabled") as? Bool, !enabled { return }
+        cutSound?.stop()
+        cutSound?.play()
+    }
+
+    /// สร้างเสียงเองในโค้ด ไม่ต้องพกไฟล์: "แกร็ก" นุ่ม ๆ สองจังหวะ — แตะเบา ๆ แล้วตามด้วยจังหวะหลัก
+    /// สัญญาณรบกวนกรองเอาเสียงแหลมออก (เหลือแค่ราว 1.2 kHz ลงมา) + เสียงทุ้มสั้น ๆ ให้มีเนื้อ · ค่อย ๆ ดังขึ้นใน 0.6 ms
+    /// จะได้ไม่บาดหู · ยาว 80 ms
+    private static let cutSound: NSSound? = {
+        let rate = 44_100
+        let count = rate * 80 / 1000
+        var seed: UInt32 = 0x2545_F491
+        func noise() -> Double {
+            seed = seed &* 1_664_525 &+ 1_013_904_223
+            return Double(Int32(bitPattern: seed)) / Double(Int32.max)
+        }
+        var samples = [Double](repeating: 0, count: count)
+        let smooth = 1 - exp(-2 * Double.pi * 1_200 / Double(rate))   // low-pass ราว 1.2 kHz
+        for (start, amplitude, decay, tone, toneAmplitude) in [(0.0, 0.5, 0.0025, 950.0, 0.12),
+                                                               (0.02, 1.0, 0.004, 700.0, 0.3)] {
+            let first = Int(start * Double(rate))
+            var filtered = 0.0
+            for i in 0..<Int(0.03 * Double(rate)) where first + i < count {
+                let t = Double(i) / Double(rate)
+                filtered += smooth * (noise() - filtered)
+                let attack = min(1, t / 0.0006)
+                samples[first + i] += attack * (amplitude * filtered * exp(-t / decay)
+                                                 + toneAmplitude * sin(2 * .pi * tone * t) * exp(-t / 0.011))
+            }
+        }
+        let peak = samples.map(abs).max() ?? 1
+        var data = Data()
+        func append<T: FixedWidthInteger>(_ value: T) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8)); append(UInt32(36 + count * 2))
+        data.append(contentsOf: Array("WAVEfmt ".utf8)); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+        append(UInt32(rate)); append(UInt32(rate * 2)); append(UInt16(2)); append(UInt16(16))
+        data.append(contentsOf: Array("data".utf8)); append(UInt32(count * 2))
+        for sample in samples { append(Int16(sample / peak * 0.6 * Double(Int16.max))) }
+        let sound = NSSound(data: data)
+        sound?.volume = 0.25   // แค่พอได้ยิน ไม่ดังแข่งกับงานที่ทำอยู่
+        return sound
+    }()
 
     private static func focusedWindow() -> AXUIElement? {
         guard let app = NSWorkspace.shared.frontmostApplication,
@@ -4335,6 +4401,12 @@ final class InputTap {
             }
         }
 
+        // Esc ใน Finder = ยกเลิกการตัด แบบ Explorer (วางทีหลังเป็นการก๊อปปกติ) · ปล่อย Esc ผ่านไปทำงานเดิมด้วย
+        // ระหว่างพิมพ์เปลี่ยนชื่อไฟล์ Esc ยกเลิกแค่การเปลี่ยนชื่อ ไม่ยุ่งกับการตัด
+        if FrontApp.isFinder, type == .keyDown, code == kVK_Escape, FinderBridge.cutPending,
+           !hasCommand, !hasControl, !hasOption, !hasShift, !FinderBridge.isEditingText() {
+            FinderBridge.cutPending = false
+        }
         if FrontApp.isFinder, handleFinderCut(type: type, code: code, flags: flags, windowsStyle: windowsStyle) {
             return true
         }
@@ -4425,12 +4497,7 @@ final class InputTap {
             if type == .keyDown {
                 let before = NSPasteboard.general.changeCount
                 SystemActions.postKey(kVK_ANSI_C, .maskCommand)
-                // ไม่ได้เลือกไฟล์ไว้ = ก๊อปไม่ติด คลิปบอร์ดไม่ขยับ → ไม่นับว่าตัด
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    let now = NSPasteboard.general.changeCount
-                    FinderBridge.cutPending = now != before
-                    FinderBridge.cutChangeCount = now
-                }
+                FinderBridge.watchCut(since: before)
             }
             return true
         }
@@ -6231,8 +6298,8 @@ final class ManualWindow: NSWindow {
              "Makes the keyboard behave like Windows: Ctrl works as Command, plus the Win key, F-keys, Home/End, the language switch key, and Explorer keys in Finder. Off = normal Mac shortcuts.",
              "ทำให้คีย์บอร์ดทำงานแบบ Windows: Ctrl ทำหน้าที่เป็น Command มีปุ่ม Win ปุ่ม F ปุ่ม Home/End ปุ่มเปลี่ยนภาษา และปุ่ม Explorer ใน Finder ปิด = ใช้คีย์ลัดแบบ Mac ปกติ"),
             ("Cut & paste files in Finder",
-             "Cut files like in Windows Explorer: select files in Finder and press Ctrl+X (or ⌘X with a Mac keyboard), then Ctrl+V / ⌘V in another folder to move them there. Works with both Windows and Mac keyboards. If you copy something else before pasting, the cut is cancelled and the paste is a normal copy. While renaming a file, these keys cut and paste text as usual.",
-             "ตัดไฟล์ได้แบบ Explorer ของ Windows: เลือกไฟล์ใน Finder แล้วกด Ctrl+X (หรือ ⌘X บนคีย์บอร์ด Mac) จากนั้นกด Ctrl+V / ⌘V ในอีกโฟลเดอร์ ไฟล์จะย้ายไปที่นั่น ใช้ได้ทั้งคีย์บอร์ด Windows และ Mac ถ้าก๊อปอย่างอื่นก่อนวาง จะยกเลิกการตัด แล้ววางเป็นการก๊อปตามปกติ ระหว่างพิมพ์เปลี่ยนชื่อไฟล์ ปุ่มเหล่านี้ยังตัด/วางตัวหนังสือได้ตามปกติ"),
+             "Cut files like in Windows Explorer: select files in Finder and press Ctrl+X (or ⌘X with a Mac keyboard), then Ctrl+V / ⌘V in another folder to move them there. A short click sound tells you the files are cut. Works with both Windows and Mac keyboards. To cancel a cut, press Esc in Finder or copy something else; the files stay where they are, and a later paste is a normal copy. While renaming a file, these keys cut and paste text as usual.",
+             "ตัดไฟล์ได้แบบ Explorer ของ Windows: เลือกไฟล์ใน Finder แล้วกด Ctrl+X (หรือ ⌘X บนคีย์บอร์ด Mac) จากนั้นกด Ctrl+V / ⌘V ในอีกโฟลเดอร์ ไฟล์จะย้ายไปที่นั่น ตอนตัดจะมีเสียง “แกร็ก” สั้น ๆ ให้รู้ว่าตัดแล้ว ใช้ได้ทั้งคีย์บอร์ด Windows และ Mac ยกเลิกการตัดได้โดยกด Esc ใน Finder หรือก๊อปอย่างอื่น ไฟล์จะอยู่ที่เดิม และถ้าวางทีหลังจะเป็นการก๊อปตามปกติ ระหว่างพิมพ์เปลี่ยนชื่อไฟล์ ปุ่มเหล่านี้ยังตัด/วางตัวหนังสือได้ตามปกติ"),
             ("Auto-Detect Keyboard",
              "Automatically follows whichever keyboard you type on — a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring.",
              "ปรับตามคีย์บอร์ดที่คุณพิมพ์ล่าสุดอัตโนมัติ คีย์บอร์ด Windows ได้คีย์ลัดแบบ Windows คีย์บอร์ด Mac ได้แบบ Mac ต้องเปิดสิทธิ์ Input Monitoring"),

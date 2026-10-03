@@ -14,7 +14,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 - **Windows Snap** — drag windows to edges/corners to snap them; Snap Layouts, Snap Assist, shared resize dividers, and `Win`+arrow keys. A maximized window shrinks to half size the moment you drag it, like Windows.
 - **Live Preview** — real, moving window thumbnails in the switcher (`Alt`+`Tab` in Windows mode, `Cmd`+`Tab` in Mac mode), Snap Assist, and when hovering the Dock.
 - **Windows keyboard** — `Ctrl` acts as `Cmd`, the `Win` key, F-keys, Home/End, Explorer keys in Finder, a Windows-style language switch key, and auto-detection of Windows vs Mac keyboards.
-- **Cut & paste files in Finder** — `Ctrl`+`X` (or `⌘`+`X` on a Mac keyboard) then `Ctrl`/`⌘`+`V` moves files, like Explorer.
+- **Cut & paste files in Finder** — `Ctrl`+`X` (or `⌘`+`X` on a Mac keyboard) then `Ctrl`/`⌘`+`V` moves files, like Explorer — a short click sound confirms the cut, and `Esc` cancels it.
 - **Mouse & scroll** — independent natural-scroll for mouse and trackpad, side-button back/forward, and `Ctrl`+scroll to zoom (sent as `⌘`+scroll to apps that zoom that way, `⌘+`/`⌘−` to the rest).
 - **System Monitor** — live CPU, RAM, SSD, and temperature cells in the menu bar with smooth animation; click for details (CPU, SSD and battery temperatures).
 - **AI Usage** — a Claude Code cell next to CPU/RAM with the same session and weekly percentages `/usage` shows, read from the file Claude Code keeps on your Mac (no account, nothing leaves your Mac). Click for weekly and per-model limits, reset times, tokens, and approximate cost.
