@@ -5837,6 +5837,17 @@ enum Thermal {
     static func percent(fromCelsius c: Double) -> Int { Int(min(100, max(0, (c - 25) / 0.8)).rounded()) }
     static func celsius(fromPercent p: Double) -> Double { 25 + p * 0.8 }
 
+    /// ชื่อสั้นสำหรับช่องในแผงรายละเอียด
+    static var shortState: String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  return "Normal"
+        case .fair:     return "Warm"
+        case .serious:  return "Hot"
+        case .critical: return "Throttling"
+        @unknown default: return "—"
+        }
+    }
+
     static var stateName: String {
         switch ProcessInfo.processInfo.thermalState {
         case .nominal:  return "Normal"
@@ -5848,6 +5859,92 @@ enum Thermal {
     }
 }
 
+/// แผงรายละเอียดของ System Monitor: ช่อง CPU · Memory · SSD · Temp ในตาราง 2 คอลัมน์ แบบโมดูลใน Control Center
+/// แต่ละช่อง: ค่าใหญ่ซ้าย · ไอคอนกับชื่อขวา · แถบ (สีเดียวกับช่องบนเมนูบาร์) · รายละเอียดสองบรรทัด
+/// ช่องสุดท้ายที่เหลือเดี่ยว (เครื่องที่อ่านอุณหภูมิไม่ได้) กว้างเต็มแถว
+final class MonitorTilesRow: MenuRowView {
+    struct Tile {
+        let symbol: String
+        let title: String
+        let value: String
+        let level: Double?          // 0–100 ความยาวแถบ · nil = ไม่มีแถบ
+        let lines: [String]
+    }
+    var tiles: [Tile] { didSet { needsDisplay = true } }
+
+    private static let tileHeight: CGFloat = 80
+    private static let gap: CGFloat = 8
+    private static let side: CGFloat = 14
+    private static let valueFont = NSFont.systemFont(ofSize: 18, weight: .bold)
+    private static let titleFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+    private static let lineFont = NSFont.systemFont(ofSize: 11)
+
+    init(tiles: [Tile]) {
+        self.tiles = tiles
+        let rows = CGFloat((tiles.count + 1) / 2)
+        super.init(frame: NSRect(x: 0, y: 0, width: 300,
+                                 height: rows * Self.tileHeight + max(0, rows - 1) * Self.gap + 8))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var preferredWidth: CGFloat { 300 }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let inner = bounds.width - Self.side * 2
+        let half = (inner - Self.gap) / 2
+        for (i, tile) in tiles.enumerated() {
+            let alone = i == tiles.count - 1 && i % 2 == 0
+            let rect = NSRect(x: Self.side + CGFloat(i % 2) * (half + Self.gap),
+                              y: 4 + CGFloat(i / 2) * (Self.tileHeight + Self.gap),
+                              width: alone ? inner : half, height: Self.tileHeight)
+            draw(tile, in: rect)
+        }
+    }
+
+    private func draw(_ tile: Tile, in rect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(0.07).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10).fill()
+        let x = rect.minX + 10, right = rect.maxX - 10
+        let level = tile.level.map { min(100, max(0, $0)) }
+
+        (tile.value as NSString).draw(at: NSPoint(x: x, y: rect.minY + 7), withAttributes: [
+            .font: Self.valueFont,
+            .foregroundColor: (level ?? 0) >= 85 ? NSColor.systemRed : NSColor.labelColor,
+        ])
+        let titleAttributes: [NSAttributedString.Key: Any] = [.font: Self.titleFont, .foregroundColor: NSColor.secondaryLabelColor]
+        let titleWidth = (tile.title as NSString).size(withAttributes: titleAttributes).width
+        (tile.title as NSString).draw(at: NSPoint(x: right - titleWidth, y: rect.minY + 12), withAttributes: titleAttributes)
+        if let icon = NSImage(systemSymbolName: tile.symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))) {
+            let size = icon.size
+            icon.draw(in: NSRect(x: right - titleWidth - 4 - size.width, y: rect.minY + 19.5 - size.height / 2,
+                                 width: size.width, height: size.height),
+                      from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+
+        let track = NSRect(x: x, y: rect.minY + 35, width: right - x, height: 5)
+        NSColor.labelColor.withAlphaComponent(0.12).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 2.5, yRadius: 2.5).fill()
+        if let level {
+            let tint: NSColor = level >= 85 ? .systemRed : level >= 70 ? .systemOrange : Skin.accent
+            tint.setFill()
+            let fill = NSRect(x: track.minX, y: track.minY, width: max(5, track.width * level / 100), height: track.height)
+            NSBezierPath(roundedRect: fill, xRadius: 2.5, yRadius: 2.5).fill()
+        }
+
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        let lineAttributes: [NSAttributedString.Key: Any] = [.font: Self.lineFont, .foregroundColor: NSColor.secondaryLabelColor,
+                                                             .paragraphStyle: style]
+        for (n, line) in tile.lines.prefix(2).enumerated() where !line.isEmpty {
+            (line as NSString).draw(in: NSRect(x: x, y: rect.minY + 46 + CGFloat(n) * 15, width: right - x, height: 15),
+                                    withAttributes: lineAttributes)
+        }
+    }
+}
+
 /// status item ตัวที่สองทางซ้ายไอคอน Deft แสดงช่อง CPU · RAM · SSD คลิกแล้วเห็นรายละเอียด
 /// อ่านค่าจาก Mach โดยตรง ไม่ต้อง spawn โปรเซสและไม่ต้องขอสิทธิ์
 final class SystemMonitor: NSObject {
@@ -5855,7 +5952,9 @@ final class SystemMonitor: NSObject {
 
     struct Sample {
         var cpu: Double = 0                       // 0–100
+        var cpuUser: Double = 0, cpuSystem: Double = 0
         var ramUsed: UInt64 = 0, ramTotal: UInt64 = 0
+        var swapUsed: UInt64 = 0
         var diskBusy: Double = 0                  // 0–100 สัดส่วนเวลาที่ดิสก์ยุ่ง (แบบ iostat %util)
         var readRate: Double = 0, writeRate: Double = 0   // bytes/s
         var diskUsed: Int64 = 0, diskTotal: Int64 = 0     // ความจุ ใช้แค่ในเมนูรายละเอียด
@@ -5866,7 +5965,9 @@ final class SystemMonitor: NSObject {
     private var item: NSStatusItem?
     private let cellsView = MonitorCellsView(frame: .zero)
     private var timer: Timer?
-    private var lastCPU: (idle: UInt64, total: UInt64)?
+    private var lastCPU: (user: UInt64, system: UInt64, idle: UInt64, total: UInt64)?
+    /// แผงรายละเอียดที่เปิดอยู่ — อัปเดตตัวเลขสดทุกรอบ (ปิดแผงแล้วหายไปเอง)
+    private weak var tilesRow: MonitorTilesRow?
     /// สถิติดิสก์รอบก่อน แยกตามไดรฟ์ (registry id) — เอาตัวที่ยุ่งที่สุดมาโชว์
     private var lastDisk: (perDrive: [UInt64: UInt64], read: UInt64, write: UInt64, at: CFAbsoluteTime)?
     private static let interval: TimeInterval = 2.0
@@ -5925,26 +6026,32 @@ final class SystemMonitor: NSObject {
 
     // MARK: อ่านค่า
 
+    /// อ่านทุกค่าเสมอ (ถูกมาก — Mach/IOKit ตรง ๆ ทุก 2 วิ) เพราะแผงรายละเอียดโชว์ครบทุกค่า
+    /// ส่วนช่องบนเมนูบาร์โชว์เฉพาะที่ผู้ใช้เลือก
     private func tick() {
         var next = Sample()
 
-        if Config.monitorCPU, let now = Self.cpuTicks() {
+        if let now = Self.cpuTicks() {
             if let last = lastCPU, now.total > last.total {
+                let span = Double(now.total - last.total)
                 let busy = Double((now.total - last.total) - (now.idle - last.idle))
-                next.cpu = min(100, max(0, busy / Double(now.total - last.total) * 100))
+                next.cpu = min(100, max(0, busy / span * 100))
+                next.cpuUser = min(100, Double(now.user &- last.user) / span * 100)
+                next.cpuSystem = min(100, Double(now.system &- last.system) / span * 100)
             } else {
-                next.cpu = sample.cpu
+                next.cpu = sample.cpu; next.cpuUser = sample.cpuUser; next.cpuSystem = sample.cpuSystem
             }
             lastCPU = now
         }
 
-        if Config.monitorRAM {
+        do {
             let memory = Self.memory()
             next.ramUsed = memory.used
             next.ramTotal = memory.total
+            next.swapUsed = Self.swapUsed()
         }
 
-        if Config.monitorSSD {
+        do {
             let disk = Self.disk()
             next.diskUsed = disk.used
             next.diskTotal = disk.total
@@ -5968,14 +6075,15 @@ final class SystemMonitor: NSObject {
             }
         }
 
-        if Config.monitorTemp { next.temp = Thermal.read() }
+        next.temp = Thermal.read()
 
         sample = next
         cellsView.cells = cells()
+        tilesRow?.tiles = tiles()
     }
 
-    /// ticks สะสมของ CPU ทุกคอร์รวมกัน (user+system+idle+nice)
-    private static func cpuTicks() -> (idle: UInt64, total: UInt64)? {
+    /// ticks สะสมของ CPU ทุกคอร์รวมกัน (user+system+idle+nice) — user นับรวม nice
+    private static func cpuTicks() -> (user: UInt64, system: UInt64, idle: UInt64, total: UInt64)? {
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size
                                            / MemoryLayout<integer_t>.size)
         var info = host_cpu_load_info_data_t()
@@ -5987,8 +6095,40 @@ final class SystemMonitor: NSObject {
         guard result == KERN_SUCCESS else { return nil }
         let user = UInt64(info.cpu_ticks.0), system = UInt64(info.cpu_ticks.1)
         let idle = UInt64(info.cpu_ticks.2), nice = UInt64(info.cpu_ticks.3)
-        return (idle, user + system + idle + nice)
+        return (user + nice, system, idle, user + system + idle + nice)
     }
+
+    /// swap ที่ใช้อยู่ (แบบ sysctl vm.swapusage)
+    private static func swapUsed() -> UInt64 {
+        var usage = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        guard sysctlbyname("vm.swapusage", &usage, &size, nil, 0) == 0 else { return 0 }
+        return usage.xsu_used
+    }
+
+    /// ชุดคอร์บน Apple Silicon ตามชื่อที่ชิปบอกเอง: M1–M4 "8P + 4E cores" (Performance + Efficiency)
+    /// M5 Pro "6S + 12P cores" (Super + Performance) · เครื่องอื่น "8 cores"
+    private static let coresText: String = {
+        func number(_ name: String) -> Int {
+            var value: Int32 = 0
+            var size = MemoryLayout<Int32>.size
+            return sysctlbyname(name, &value, &size, nil, 0) == 0 ? Int(value) : 0
+        }
+        func text(_ name: String) -> String {
+            var size = 0
+            guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return "" }
+            var buffer = [CChar](repeating: 0, count: size)
+            guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return "" }
+            return String(cString: buffer)
+        }
+        let levels = (0..<number("hw.nperflevels")).compactMap { level -> String? in
+            let cores = number("hw.perflevel\(level).physicalcpu")
+            guard cores > 0, let initial = text("hw.perflevel\(level).name").first else { return nil }
+            return "\(cores)\(initial)"
+        }
+        if levels.count > 1 { return levels.joined(separator: " + ") + " cores" }
+        return "\(ProcessInfo.processInfo.activeProcessorCount) cores"
+    }()
 
     /// "Memory Used" แบบเดียวกับ Activity Monitor = app memory + wired + compressed
     private static func memory() -> (used: UInt64, total: UInt64) {
@@ -6048,19 +6188,49 @@ final class SystemMonitor: NSObject {
 
     // MARK: แสดงผล
 
-    private static func rate(_ bytesPerSecond: Double) -> String {
-        let mb = bytesPerSecond / 1_048_576
-        if mb < 0.1 { return "0 MB/s" }
-        return mb < 10 ? String(format: "%.1f MB/s", mb) : "\(Int(mb.rounded())) MB/s"
-    }
-
     private static func percent(_ used: some BinaryInteger, _ total: some BinaryInteger) -> Int {
         guard total > 0 else { return 0 }
         return Int((Double(used) / Double(total) * 100).rounded())
     }
 
-    private static func gigabytes(_ bytes: some BinaryInteger) -> String {
-        String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+    /// ตัวเลขในช่องสั้น ๆ: 24 GB · 11.9 GB · 582 GB
+    private static func size(_ bytes: some BinaryInteger, unit: Bool = true) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        if gb >= 1000 { return String(format: "%.1f", gb / 1024) + (unit ? " TB" : "") }
+        let number = gb < 0.05 ? "0" : gb >= 100 || gb == gb.rounded() ? String(format: "%.0f", gb) : String(format: "%.1f", gb)
+        return unit ? number + " GB" : number
+    }
+
+    private static func speed(_ bytesPerSecond: Double) -> String {
+        let mb = bytesPerSecond / 1_048_576
+        return mb < 0.1 ? "0" : mb < 10 ? String(format: "%.1f", mb) : "\(Int(mb.rounded()))"
+    }
+
+    private func tiles() -> [MonitorTilesRow.Tile] {
+        let s = sample
+        let ram = Self.percent(s.ramUsed, s.ramTotal)
+        var result: [MonitorTilesRow.Tile] = [
+            .init(symbol: "cpu", title: "CPU", value: "\(Int(s.cpu.rounded()))%", level: s.cpu,
+                  lines: ["User \(Int(s.cpuUser.rounded()))% · Sys \(Int(s.cpuSystem.rounded()))%", Self.coresText]),
+            .init(symbol: "memorychip", title: "Memory", value: "\(ram)%", level: Double(ram),
+                  lines: ["\(Self.size(s.ramUsed, unit: false)) of \(Self.size(s.ramTotal))", "Swap \(Self.size(s.swapUsed))"]),
+            .init(symbol: "internaldrive", title: "SSD", value: "\(Int(s.diskBusy.rounded()))%", level: s.diskBusy,
+                  lines: ["↓ \(Self.speed(s.readRate))  ↑ \(Self.speed(s.writeRate)) MB/s",
+                          "\(Self.size(max(0, s.diskTotal - s.diskUsed))) free"]),
+        ]
+        if Thermal.available {
+            let t = s.temp
+            var level = t?.cpuMax.map { Double(Thermal.percent(fromCelsius: $0)) }
+            if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { level = max(level ?? 0, 85) }
+            var parts: [String] = []
+            if let c = t?.ssd { parts.append("SSD \(Int(c.rounded()))°") }
+            if let c = t?.battery { parts.append("Battery \(Int(c.rounded()))°") }
+            result.append(.init(symbol: "thermometer.medium", title: "Temp",
+                                value: t?.cpuMax.map { "\(Int($0.rounded()))°C" } ?? "–", level: level,
+                                lines: [parts.joined(separator: " · "),
+                                        (t?.cpuAvg.map { "Avg \(Int($0.rounded()))° · " } ?? "") + Thermal.shortState]))
+        }
+        return result
     }
 
     private func cells() -> [MonitorCellsView.Cell] {
@@ -6093,28 +6263,13 @@ final class SystemMonitor: NSObject {
         guard let button = item?.button, let window = button.window else { return }
         let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
         let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main ?? NSScreen.screens[0]
-        let s = sample
+        // แผงรายละเอียดโชว์ครบทุกค่าเสมอ ไม่ว่าบนเมนูบาร์จะเลือกช่องไหนไว้
         var rows: [MenuRowView] = []
-        if Config.monitorCPU { rows.append(MenuNoteRow("CPU  \(Int(s.cpu.rounded()))%")) }
-        if Config.monitorRAM {
-            rows.append(MenuNoteRow("RAM  \(Self.gigabytes(s.ramUsed)) / \(Self.gigabytes(s.ramTotal))  (\(Self.percent(s.ramUsed, s.ramTotal))%)"))
-        }
-        if Config.monitorSSD {
-            rows.append(MenuNoteRow("SSD  busy \(Int(s.diskBusy.rounded()))%   ↓ \(Self.rate(s.readRate))   ↑ \(Self.rate(s.writeRate))"))
-            rows.append(MenuNoteRow("       used \(Self.gigabytes(s.diskUsed)) / \(Self.gigabytes(s.diskTotal))  (\(Self.percent(s.diskUsed, s.diskTotal))%)"))
-        }
-        if Config.monitorTemp, let t = s.temp {
-            var parts: [String] = []
-            if let c = t.cpuMax { parts.append("CPU \(Int(c.rounded()))°C") }
-            if let c = t.ssd { parts.append("SSD \(Int(c.rounded()))°C") }
-            if let c = t.battery { parts.append("Battery \(Int(c.rounded()))°C") }
-            rows.append(MenuNoteRow("Temp  " + parts.joined(separator: "   ")))
-            if let avg = t.cpuAvg {
-                rows.append(MenuNoteRow("       CPU average \(Int(avg.rounded()))°C  ·  \(Thermal.stateName)"))
-            }
-        }
+        let tilesRow = MonitorTilesRow(tiles: tiles())
+        self.tilesRow = tilesRow
+        rows.append(tilesRow)
         if AIUsage.shared.showing {
-            if !rows.isEmpty { rows.append(MenuSeparatorRow()) }
+            rows.append(MenuSeparatorRow())
             rows.append(contentsOf: AIUsage.shared.detailRows())
         }
         rows.append(MenuSeparatorRow())
@@ -6321,8 +6476,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
             ("CPU · RAM · SSD · Temperature",
-             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). The details also show SSD and battery temperatures and macOS's thermal state.",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) ในรายละเอียดมีอุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบด้วย"),
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open.",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
