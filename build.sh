@@ -8,7 +8,8 @@
 #   ตัวแปรสภาพแวดล้อม:
 #     KNACK_VERSION=4.1 KNACK_BUILD=5   เลขรุ่นที่ใส่ใน Info.plist (ค่าเริ่มต้น 1.0 / 1)
 #     KNACK_RELEASE=1                    เซ็นแบบส่ง notarize: hardened runtime + timestamp
-#     KNACK_APP=/path/Knack.app          ตำแหน่งแอปที่จะสร้าง (ค่าเริ่มต้น ~/Applications/Knack.app)
+#     KNACK_APP=/path/Deft.app           ตำแหน่งแอปที่จะสร้าง (ค่าเริ่มต้น /Applications/Deft.app — ทับตัวที่ติดตั้งไว้
+#                                        ให้ในเครื่องมี Deft ตัวเดียว Open at Login จะได้ไม่ไปเปิดตัวเก่า)
 #
 # หมายเหตุเรื่องสิทธิ์: macOS ผูกสิทธิ์ Accessibility ไว้กับ code signature requirement
 # ถ้าเซ็นแบบ ad-hoc requirement จะเป็น cdhash ซึ่งเปลี่ยนทุกครั้งที่ compile
@@ -19,7 +20,7 @@
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="${KNACK_APP:-$HOME/Applications/Deft.app}"
+APP="${KNACK_APP:-/Applications/Deft.app}"
 NAME="${KNACK_NAME:-Deft}"
 BUNDLE_ID="${KNACK_BUNDLE_ID:-com.nonbannawat.deft}"
 VERSION="${KNACK_VERSION:-1.3.4}"
