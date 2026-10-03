@@ -3007,8 +3007,10 @@ enum LanguageSwitcher {
 // MARK: - คุยกับ Finder --------------------------------------------------------
 
 enum FinderBridge {
-    /// ตัดไฟล์ค้างอยู่หรือเปล่า (Ctrl+X แล้วรอ Ctrl+V)
+    /// ตัดไฟล์ค้างอยู่หรือเปล่า (X แล้วรอ V) · cutChangeCount = คลิปบอร์ดตอนตัด
+    /// คลิปบอร์ดเปลี่ยนหลังจากนั้น (ก๊อปอย่างอื่น) = ยกเลิกการตัด วางแล้วเป็นการก๊อปตามปกติ
     static var cutPending = false
+    static var cutChangeCount = -1
 
     private static func focusedWindow() -> AXUIElement? {
         guard let app = NSWorkspace.shared.frontmostApplication,
@@ -4333,6 +4335,9 @@ final class InputTap {
             }
         }
 
+        if FrontApp.isFinder, handleFinderCut(type: type, code: code, flags: flags, windowsStyle: windowsStyle) {
+            return true
+        }
         if windowsStyle, FrontApp.isFinder,
            handleFinderKey(type: type, event: event, code: code, flags: flags) {
             return true
@@ -4406,28 +4411,44 @@ final class InputTap {
         return false
     }
 
+    /// ตัด/วางไฟล์แบบ Windows ใน Finder (Finder เองตัดไฟล์ไม่ได้ ต้องก๊อปแล้ววางด้วย ⌘⌥V)
+    /// X = ก๊อปไว้ก่อน แล้ว V = ย้ายไฟล์มาที่นี่ · Ctrl+X/V ได้ทุกโหมด ⌘X/V เฉพาะโหมด Mac
+    /// (โหมด Windows ปุ่ม ⌘ คือปุ่ม Win) · ระหว่างพิมพ์เปลี่ยนชื่อไฟล์ ปล่อยให้ตัด/วางตัวหนังสือตามปกติ
+    private func handleFinderCut(type: CGEventType, code: Int, flags: CGEventFlags, windowsStyle: Bool) -> Bool {
+        guard code == kVK_ANSI_X || code == kVK_ANSI_V else { return false }
+        let hasCommand = flags.contains(.maskCommand), hasControl = flags.contains(.maskControl)
+        guard !flags.contains(.maskAlternate), !flags.contains(.maskShift), hasCommand != hasControl,
+              hasControl || !windowsStyle else { return false }
+        guard !FinderBridge.isEditingText() else { return false }
+
+        if code == kVK_ANSI_X {
+            if type == .keyDown {
+                let before = NSPasteboard.general.changeCount
+                SystemActions.postKey(kVK_ANSI_C, .maskCommand)
+                // ไม่ได้เลือกไฟล์ไว้ = ก๊อปไม่ติด คลิปบอร์ดไม่ขยับ → ไม่นับว่าตัด
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    let now = NSPasteboard.general.changeCount
+                    FinderBridge.cutPending = now != before
+                    FinderBridge.cutChangeCount = now
+                }
+            }
+            return true
+        }
+        // V: ย้ายเฉพาะตอนที่ของในคลิปบอร์ดยังเป็นของที่ตัดไว้ ไม่งั้นปล่อยเป็นการวางปกติ
+        guard FinderBridge.cutPending, NSPasteboard.general.changeCount == FinderBridge.cutChangeCount else { return false }
+        if type == .keyDown {
+            FinderBridge.cutPending = false
+            SystemActions.postKey(kVK_ANSI_V, [.maskCommand, .maskAlternate])
+        }
+        return true
+    }
+
     /// ชุดปุ่มแบบ Explorer — ทำงานเฉพาะตอน Finder อยู่หน้าสุด
     private func handleFinderKey(type: CGEventType, event: CGEvent,
                                  code: Int, flags: CGEventFlags) -> Bool {
         let hasCommand = flags.contains(.maskCommand)
         let hasControl = flags.contains(.maskControl)
 
-        // Ctrl+X ตัดไฟล์ → คัดลอกไว้ก่อน ค่อยย้ายตอนวาง
-        if code == kVK_ANSI_X, hasControl {
-            if type == .keyDown {
-                FinderBridge.cutPending = true
-                SystemActions.postKey(kVK_ANSI_C, .maskCommand)
-            }
-            return true
-        }
-        // วางหลังตัด = ย้ายไฟล์ (Mac ใช้ Cmd+Option+V)
-        if code == kVK_ANSI_V, hasControl || hasCommand, FinderBridge.cutPending {
-            if type == .keyDown {
-                FinderBridge.cutPending = false
-                SystemActions.postKey(kVK_ANSI_V, [.maskCommand, .maskAlternate])
-            }
-            return true
-        }
         guard !hasCommand, !hasControl else { return false }
 
         switch code {
@@ -6209,6 +6230,9 @@ final class ManualWindow: NSWindow {
             ("Windows Shortcuts",
              "Makes the keyboard behave like Windows: Ctrl works as Command, plus the Win key, F-keys, Home/End, the language switch key, and Explorer keys in Finder. Off = normal Mac shortcuts.",
              "ทำให้คีย์บอร์ดทำงานแบบ Windows: Ctrl ทำหน้าที่เป็น Command มีปุ่ม Win ปุ่ม F ปุ่ม Home/End ปุ่มเปลี่ยนภาษา และปุ่ม Explorer ใน Finder ปิด = ใช้คีย์ลัดแบบ Mac ปกติ"),
+            ("Cut & paste files in Finder",
+             "Cut files like in Windows Explorer: select files in Finder and press Ctrl+X (or ⌘X with a Mac keyboard), then Ctrl+V / ⌘V in another folder to move them there. Works with both Windows and Mac keyboards. If you copy something else before pasting, the cut is cancelled and the paste is a normal copy. While renaming a file, these keys cut and paste text as usual.",
+             "ตัดไฟล์ได้แบบ Explorer ของ Windows: เลือกไฟล์ใน Finder แล้วกด Ctrl+X (หรือ ⌘X บนคีย์บอร์ด Mac) จากนั้นกด Ctrl+V / ⌘V ในอีกโฟลเดอร์ ไฟล์จะย้ายไปที่นั่น ใช้ได้ทั้งคีย์บอร์ด Windows และ Mac ถ้าก๊อปอย่างอื่นก่อนวาง จะยกเลิกการตัด แล้ววางเป็นการก๊อปตามปกติ ระหว่างพิมพ์เปลี่ยนชื่อไฟล์ ปุ่มเหล่านี้ยังตัด/วางตัวหนังสือได้ตามปกติ"),
             ("Auto-Detect Keyboard",
              "Automatically follows whichever keyboard you type on — a Windows keyboard gets Windows shortcuts, a Mac keyboard gets Mac ones. Needs Input Monitoring.",
              "ปรับตามคีย์บอร์ดที่คุณพิมพ์ล่าสุดอัตโนมัติ คีย์บอร์ด Windows ได้คีย์ลัดแบบ Windows คีย์บอร์ด Mac ได้แบบ Mac ต้องเปิดสิทธิ์ Input Monitoring"),
@@ -7031,10 +7055,18 @@ final class MenuList {
 
 /// หน้าต่างเมนูกระจกใต้ไอคอน Deft — Liquid Glass แบบเดียวกับ Cmd+Tab
 /// ปิดเมื่อคลิกที่อื่น กด Esc หรือกดไอคอนซ้ำ  ·  แถวที่สับสวิตช์จะวาดใหม่ในที่โดยเมนูไม่ปิด
+/// แถบเลื่อนแบบลอยทับเนื้อหาเสมอ — ถ้าเครื่องตั้ง "แสดงแถบเลื่อนตลอด" (เช่นตอนเสียบเมาส์)
+/// แถบแบบเดิมจะกินความกว้างไป ~15 pt ทำให้สวิตช์ด้านขวาของเมนูถูกตัดขอบ
+final class OverlayScrollView: NSScrollView {
+    override var scrollerStyle: NSScroller.Style { get { .overlay } set {} }
+}
+
 final class MenuPanel: NSPanel {
     static let shared = MenuPanel()
 
     private let container = NSView()
+    /// เมนูสูงเกินจอ (เช่น จอ MacBook) ถึงบีบแถวแล้วก็ยังไม่พอ → เลื่อนดูได้แบบเมนูของ macOS
+    private let scroller = OverlayScrollView()
     private var sectionCards: [NSView] = []
     private var monitors: [Any] = []
     private(set) var dismissedAt: CFAbsoluteTime = 0
@@ -7055,17 +7087,42 @@ final class MenuPanel: NSPanel {
         acceptsMouseMovedEvents = true
         isReleasedWhenClosed = false
         container.wantsLayer = true
-        contentView = GlassBackdrop.wrap(container, cornerRadius: 22, frosted: false)   // กระจกใสแบบเดียวกับพาเนลพรีวิว
+        scroller.documentView = container
+        scroller.drawsBackground = false
+        scroller.contentView.drawsBackground = false
+        scroller.borderType = .noBorder
+        scroller.hasVerticalScroller = true
+        scroller.autohidesScrollers = true
+        scroller.scrollerStyle = .overlay
+        scroller.hasHorizontalScroller = false
+        contentView = GlassBackdrop.wrap(scroller, cornerRadius: 22, frosted: false)   // กระจกใสแบบเดียวกับพาเนลพรีวิว
     }
 
     override var canBecomeKey: Bool { true }
 
     /// วางแถวบนลงล่าง ความกว้างเท่ากันทั้งเมนู (แถวที่กว้างสุดเป็นตัวกำหนด)
-    private func layout(_ rows: [MenuRowView]) -> NSSize {
+    /// สูงเกิน maxHeight (จอเตี้ย เช่น MacBook) → บีบความสูงของแถวทั่วไปลงทีละนิด (สูงสุด 5 pt ต่อแถว)
+    /// แถวพวกนี้วาดอิงกึ่งกลางแถว จึงแค่ชิดกันขึ้น หน้าตาไม่เพี้ยน · ยังไม่พออีกค่อยให้เลื่อนดู
+    private func layout(_ rows: [MenuRowView], maxHeight: CGFloat = .greatestFiniteMagnitude) -> NSSize {
         container.subviews.forEach { $0.removeFromSuperview() }
         let width = max(300, rows.map(\.preferredWidth).max() ?? 300)
         var height = Self.padding * 2
         for row in rows { height += row.frame.height }
+        if height > maxHeight {
+            let squeezable = rows.filter {
+                $0 is MenuToggleRow || $0 is DisplayRowView || $0 is MenuSwitchExpandRow || $0 is MenuActionRow
+                    || $0 is MenuItemRow || $0 is MenuDisclosureRow || $0 is MenuHeaderLabelRow
+                    || $0 is MenuSeparatorRow || $0 is MenuNoteRow
+            }
+            if !squeezable.isEmpty {
+                let each = min(5, ceil((height - maxHeight) / CGFloat(squeezable.count)))
+                for row in squeezable {
+                    let cut = row is MenuNoteRow ? min(each, 3) : each
+                    row.setFrameSize(NSSize(width: row.frame.width, height: row.frame.height - cut))
+                    height -= cut
+                }
+            }
+        }
         container.setFrameSize(NSSize(width: width, height: height))
         var y = height - Self.padding
         for row in rows {
@@ -7142,12 +7199,15 @@ final class MenuPanel: NSPanel {
     }
 
     func present(rows: [MenuRowView], below anchor: NSRect, on screen: NSScreen) {
-        let size = layout(rows)
         let visible = screen.visibleFrame
+        let room = min(anchor.minY - 6, visible.maxY) - (visible.minY + 4)    // ที่ว่างใต้ไอคอนจนถึงขอบล่างจอ
+        let content = layout(rows, maxHeight: room)
+        let size = NSSize(width: content.width, height: min(content.height, room))
         var origin = NSPoint(x: anchor.minX, y: anchor.minY - 6 - size.height)
         origin.x = min(max(origin.x, visible.minX + 4), visible.maxX - size.width - 4)
         origin.y = max(origin.y, visible.minY + 4)
         setFrame(NSRect(origin: origin, size: size), display: true)
+        scrollToTop(contentHeight: content.height)
         alphaValue = 0
         orderFrontRegardless()
         makeKey()
@@ -7164,10 +7224,29 @@ final class MenuPanel: NSPanel {
     func reload(rows: [MenuRowView]) {
         guard isVisible else { return }
         let top = frame.maxY
-        let size = layout(rows)
+        let bottom = (screen ?? NSScreen.main)?.visibleFrame.minY ?? 0
+        let room = top - (bottom + 4)
+        let offset = scroller.contentView.bounds.origin.y
+        let oldHeight = container.frame.height
+        let content = layout(rows, maxHeight: room)
+        let size = NSSize(width: content.width, height: min(content.height, room))
         setFrame(NSRect(x: frame.minX, y: top - size.height, width: size.width, height: size.height), display: true)
+        // สลับสวิตช์ระหว่างเลื่อนอยู่ → คงตำแหน่งที่ดูอยู่ไว้ (นับจากขอบบน) ไม่เด้งกลับขึ้นบนสุด
+        let fromTop = oldHeight - offset
+        scrollToTop(contentHeight: content.height, keepingFromTop: fromTop)
         GlassBackdrop.adaptToBackdrop(self)
         tintCards()
+    }
+
+    /// documentView ไม่ได้กลับแกน — ขอบบนของเนื้อหาอยู่ที่ y = ความสูงเนื้อหา − ความสูงช่องมอง
+    private func scrollToTop(contentHeight: CGFloat, keepingFromTop fromTop: CGFloat? = nil) {
+        let visibleHeight = scroller.contentView.bounds.height
+        let fits = contentHeight <= visibleHeight + 0.5
+        scroller.verticalScrollElasticity = fits ? .none : .automatic
+        var y = max(0, contentHeight - visibleHeight)
+        if let fromTop, !fits { y = min(max(0, contentHeight - fromTop), contentHeight - visibleHeight) }
+        scroller.contentView.scroll(to: NSPoint(x: 0, y: y))
+        scroller.reflectScrolledClipView(scroller.contentView)
     }
 
     func dismiss() {
