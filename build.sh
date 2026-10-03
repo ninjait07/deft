@@ -43,8 +43,11 @@ pick_identity() {
 
 IDENTITY="${KNACK_IDENTITY:-$(pick_identity)}"
 
-echo "==> หยุดตัวเดิมถ้าเปิดอยู่"
-pkill -x "$NAME" 2>/dev/null || true
+# release build ลง dist/stage ไม่ได้ทับตัวที่เปิดอยู่ — ไม่ต้องปิด Deft ที่ผู้ใช้กำลังใช้
+if [ "${KNACK_RELEASE:-0}" != "1" ]; then
+    echo "==> หยุดตัวเดิมถ้าเปิดอยู่"
+    pkill -x "$NAME" 2>/dev/null || true
+fi
 
 echo "==> คอมไพล์"
 rm -rf "$APP"
