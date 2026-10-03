@@ -50,7 +50,11 @@ echo "==> คอมไพล์"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-swiftc -O -swift-version 5 \
+# hooks ถ่ายภาพ/อัด GIF สำหรับทำเอกสาร ใส่เฉพาะ dev build — process ไหนก็สั่งได้ ห้ามติดไปกับ release
+DEV_HOOKS="-DDEFT_DEV_HOOKS"
+if [ "${KNACK_RELEASE:-0}" = "1" ]; then DEV_HOOKS=""; fi
+
+swiftc -O -swift-version 5 $DEV_HOOKS \
     -target arm64-apple-macos13.0 \
     -o "$APP/Contents/MacOS/$NAME" \
     "$SRC_DIR/Deft.swift" \

@@ -7516,8 +7516,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Geometry.refresh()
         FrontApp.start()
         Updater.scheduleAutomatic()
+        #if DEFT_DEV_HOOKS
         installScreenshotHook()
         installRecorderHook()
+        #endif
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
@@ -7625,9 +7627,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func relaunch() {
+        // ส่ง path เป็น argument แยก ($0) ไม่ต่อเข้าไปในคำสั่ง — path ที่มี ' จะได้ไม่ทำให้คำสั่งพัง
         let task = Process()
-        task.launchPath = "/bin/sh"
-        task.arguments = ["-c", "sleep 1; open '" + Bundle.main.bundlePath + "'"]
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "sleep 1; open \"$0\"", Bundle.main.bundlePath]
         try? task.run()
         NSApp.terminate(nil)
     }
@@ -7642,6 +7645,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusItem()
     }
 
+    // MARK: hooks สำหรับทำเอกสาร (เฉพาะ dev build) ------------------------------------
+    // ถ่ายภาพ / อัด GIF / ฉากหลังสาธิต สั่งผ่าน distributed notification ซึ่ง process ไหนในเครื่องก็ส่งได้
+    // โดยไม่ต้องมีสิทธิ์อะไร — ถ้าติดไปกับ release จะกลายเป็นช่องให้โปรแกรมอื่นยืมสิทธิ์ Screen Recording ของ Deft
+    // ถ่ายจอแล้วเขียนไฟล์ลงที่ไหนก็ได้ (รายงานใน issue #1) จึงคอมไพล์เฉพาะตอน build.sh ไม่ได้ตั้ง KNACK_RELEASE=1
+    #if DEFT_DEV_HOOKS
     // MARK: ถ่ายภาพประกอบเอกสาร (dev) — `deft-shots <dir>` ส่ง notification มา แอปเปิดแต่ละหน้าแล้วถ่ายให้
     private func installScreenshotHook() {
         DistributedNotificationCenter.default().addObserver(
@@ -7787,6 +7795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             knackLog("shots: done → \(dir.path)")
         }
     }
+    #endif
 
     /// คลิกไอคอน = เปิด/ปิดเมนูกระจกใต้ไอคอน
     @objc private func toggleMenu() {
