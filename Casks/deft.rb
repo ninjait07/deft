@@ -1,6 +1,6 @@
 cask "deft" do
-  version "1.3.2"
-  sha256 "2218a521bbbb64786c4be0eec84f1fb66eec305091b9974bad335444996a1173"
+  version "1.3.3"
+  sha256 "8aeb27c110a107c41528d9ca1be665631b939768fa586d207a5fb435e81a8f81"
 
   url "https://github.com/ninjait07/deft/releases/download/v#{version}/Deft-#{version}.dmg"
   name "Deft"
