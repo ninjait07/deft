@@ -5290,9 +5290,6 @@ final class AIUsage {
         var current: Block?
         var limit = 0.0                // ค่างาน ($ เทียบ API) ที่ถือเป็น 100% ของหน้าต่าง
         var maxBlock = 0.0             // หน้าต่างที่เคยหนักสุด (เพดานอัตโนมัติ ถ้ายังไม่ได้เทียบกับ /usage)
-        var todayTokens = 0, todayCost = 0.0, todayOutput = 0
-        var weekCost = 0.0
-        var monthTokens = 0, monthCost = 0.0
         var scanned = false
         var fraction: Double {
             if let officialFraction { return officialFraction }
@@ -5479,7 +5476,6 @@ final class AIUsage {
         var blocks: [Block] = []
         var current: Block?
         let calendar = Calendar.current
-        let weekAgo = Date().addingTimeInterval(-7 * 86400)
         for e in entries {
             let cost = e.cost
             if var b = current, e.time < b.end, e.time.timeIntervalSince(b.lastActivity) < 5 * 3600 {
@@ -5492,9 +5488,6 @@ final class AIUsage {
                 current = Block(start: calendar.date(from: start) ?? e.time, lastActivity: e.time,
                                 cost: cost, output: e.output, tokens: e.total)
             }
-            if calendar.isDateInToday(e.time) { s.todayTokens += e.total; s.todayCost += cost; s.todayOutput += e.output }
-            if e.time >= weekAgo { s.weekCost += cost }
-            if calendar.isDate(e.time, equalTo: Date(), toGranularity: .month) { s.monthTokens += e.total; s.monthCost += cost }
         }
         if let b = current { blocks.append(b) }
         s.maxBlock = max(blocks.map(\.cost).max() ?? 0, Double(Config.aiUsageMaxCost))
@@ -5541,10 +5534,16 @@ final class AIUsage {
 
     // MARK: รายละเอียดเมื่อคลิก
 
-    static func tokens(_ n: Int) -> String {
-        n >= 1_000_000 ? String(format: "%.2fM", Double(n) / 1e6) : n >= 1000 ? String(format: "%.0fK", Double(n) / 1e3) : "\(n)"
+    /// โควต้ารายสัปดาห์ — เลยเวลารีเซ็ตแล้ว = ตัวเลขที่ Claude Code จำไว้เป็นของสัปดาห์ก่อน ไม่ใช่ของตอนนี้
+    /// (เคยโชว์ 61% "Resets in 0m" ค้างไว้ทั้งที่สัปดาห์ใหม่เริ่มไปแล้ว) — ไม่รู้ตัวเลขใหม่ก็บอกตรง ๆ
+    private static func weeklyRow(percent: Double, label: String, resets: Date?) -> UsageBarRow {
+        guard let resets else { return UsageBarRow(percent: percent, label: label, detail: "7-day window") }
+        guard resets > Date() else {
+            return UsageBarRow(percent: nil, label: label, detail: "New week · run /usage in Claude Code to update")
+        }
+        return UsageBarRow(percent: percent, label: label, detail: "Resets in \(countdown(to: resets))")
     }
-    private static func money(_ v: Double) -> String { String(format: "≈ $%.2f", v) }
+
     private static func countdown(to date: Date) -> String {
         let s = max(0, Int(date.timeIntervalSinceNow))
         if s >= 86400 { return "\(s / 86400)d \((s % 86400) / 3600)h" }
@@ -5565,29 +5564,21 @@ final class AIUsage {
             else { detail = "No active session — starts with your next message" }
             rows.append(UsageBarRow(percent: s.fraction, label: "Current session", detail: detail))
             if let weekly = o.weekly {
-                rows.append(UsageBarRow(percent: weekly, label: "Weekly",
-                                        detail: o.weeklyResets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
+                rows.append(Self.weeklyRow(percent: weekly, label: "Weekly", resets: o.weeklyResets))
             }
             for scoped in o.scoped where scoped.percent > 0 {
-                rows.append(UsageBarRow(percent: scoped.percent, label: "\(scoped.name) weekly",
-                                        detail: scoped.resets.map { "Resets in \(Self.countdown(to: $0))" } ?? "7-day window"))
+                rows.append(Self.weeklyRow(percent: scoped.percent, label: "\(scoped.name) weekly", resets: scoped.resets))
             }
-            let age = Int(Date().timeIntervalSince(o.fetchedAt) / 60)
-            rows.append(MenuNoteRow(age < 1 ? "From Claude Code's /usage, just now"
-                                            : "From Claude Code's /usage, \(age) min ago + activity since"))
+            // ตัวเลขทางการมาจาก /usage ของ Claude Code — เก่าแค่ไหน (หลังจากนั้นเป็นค่าประมาณจากงานที่ทำต่อ)
+            let minutes = Int(Date().timeIntervalSince(o.fetchedAt) / 60)
+            let age = minutes < 60 ? "\(minutes) min" : minutes < 48 * 60 ? "\(minutes / 60) h" : "\(minutes / 1440) days"
+            rows.append(MenuNoteRow(minutes < 1 ? "Updated just now" : "Updated \(age) ago · estimated since then"))
         } else if let b = s.current, b.isActive {
             rows.append(UsageBarRow(percent: s.fraction, label: "Current window ≈",
                                     detail: "Resets in \(Self.countdown(to: b.end)) · open Claude Code for exact numbers"))
         } else {
             rows.append(MenuNoteRow("No active window — the next message starts a fresh 5-hour window"))
         }
-        rows.append(MenuSeparatorRow())
-        if let b = s.current, b.isActive {
-            rows.append(MenuNoteRow("This window   \(Self.money(b.cost))   ·   \(Self.tokens(b.output)) out"))
-        }
-        rows.append(MenuNoteRow("Today   \(Self.money(s.todayCost))   ·   \(Self.tokens(s.todayOutput)) out"))
-        rows.append(MenuNoteRow("This month   \(Self.money(s.monthCost))"))
-        rows.append(MenuNoteRow("$ = API-price equivalent, not what your plan charges"))
         return rows
     }
 
@@ -5595,12 +5586,12 @@ final class AIUsage {
 
 /// แถวแสดงโควต้าแบบแถบ: "50%  [Current]" / แถบ / "Resets in 1h 22m"
 final class UsageBarRow: MenuRowView {
-    private let percent: Double
+    private let percent: Double?   // nil = ยังไม่รู้ (โชว์ – และแถบว่าง)
     private let label: String
     private let detail: String
 
-    init(percent: Double, label: String, detail: String) {
-        self.percent = min(1, max(0, percent)); self.label = label; self.detail = detail
+    init(percent: Double?, label: String, detail: String) {
+        self.percent = percent.map { min(1, max(0, $0)) }; self.label = label; self.detail = detail
         super.init(frame: NSRect(x: 0, y: 0, width: 260, height: 58))
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -5609,7 +5600,7 @@ final class UsageBarRow: MenuRowView {
     override func draw(_ dirtyRect: NSRect) {
         let x: CGFloat = 14, right = bounds.maxX - 14
         let big = NSFont.systemFont(ofSize: 18, weight: .bold)
-        let value = "\(Int((percent * 100).rounded()))%"
+        let value = percent.map { "\(Int(($0 * 100).rounded()))%" } ?? "–"
         (value as NSString).draw(at: NSPoint(x: x, y: bounds.maxY - 26), withAttributes: [.font: big, .foregroundColor: NSColor.labelColor])
 
         // ป้ายชื่อหน้าต่าง (pill) ชิดขวา
@@ -5625,10 +5616,12 @@ final class UsageBarRow: MenuRowView {
         let track = NSRect(x: x, y: bounds.maxY - 36, width: right - x, height: 6)
         NSColor.labelColor.withAlphaComponent(0.12).setFill()
         NSBezierPath(roundedRect: track, xRadius: 3, yRadius: 3).fill()
-        let color: NSColor = percent >= 0.9 ? .systemRed : percent >= 0.7 ? .systemOrange : .systemBlue
-        let fill = NSRect(x: track.minX, y: track.minY, width: max(6, track.width * CGFloat(percent)), height: track.height)
-        color.setFill()
-        NSBezierPath(roundedRect: fill, xRadius: 3, yRadius: 3).fill()
+        if let percent {
+            let color: NSColor = percent >= 0.9 ? .systemRed : percent >= 0.7 ? .systemOrange : .systemBlue
+            let fill = NSRect(x: track.minX, y: track.minY, width: max(6, track.width * CGFloat(percent)), height: track.height)
+            color.setFill()
+            NSBezierPath(roundedRect: fill, xRadius: 3, yRadius: 3).fill()
+        }
 
         (detail as NSString).draw(at: NSPoint(x: x, y: bounds.maxY - 52),
                                   withAttributes: [.font: NSFont.systemFont(ofSize: 11),
@@ -6312,8 +6305,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("AI Usage", "โควต้า AI", [
             ("Claude Code Quota",
-             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times, plus tokens and an approximate API-price cost. When Claude Code hasn't run for a while the value is marked ≈. The cell only appears on Macs where Claude Code is installed — usage on claude.ai alone can't be shown, because Anthropic doesn't let other apps read it.",
-             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต token และค่าใช้จ่ายโดยประมาณตามราคา API ถ้าไม่ได้เปิด Claude Code มาสักพัก ตัวเลขจะมี ≈ นำหน้า ช่องนี้จะขึ้นเฉพาะเครื่องที่ติดตั้ง Claude Code เท่านั้น ถ้าใช้แค่ claude.ai บนเว็บจะแสดงไม่ได้ เพราะ Anthropic ไม่อนุญาตให้แอปอื่นอ่านข้อมูลนี้"),
+             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times. When Claude Code hasn't checked for a while the value is marked ≈; if a new week has started since, the weekly limit shows – until you run /usage in Claude Code. The cell only appears on Macs where Claude Code is installed — usage on claude.ai alone can't be shown, because Anthropic doesn't let other apps read it.",
+             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต ถ้า Claude Code ไม่ได้เช็กมาสักพัก ตัวเลขจะมี ≈ นำหน้า และถ้าขึ้นสัปดาห์ใหม่ไปแล้ว โควต้ารายสัปดาห์จะแสดง – จนกว่าจะรัน /usage ใน Claude Code ช่องนี้จะขึ้นเฉพาะเครื่องที่ติดตั้ง Claude Code เท่านั้น ถ้าใช้แค่ claude.ai บนเว็บจะแสดงไม่ได้ เพราะ Anthropic ไม่อนุญาตให้แอปอื่นอ่านข้อมูลนี้"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",

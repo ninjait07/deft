@@ -17,7 +17,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 - **Cut & paste files in Finder** — `Ctrl`+`X` (or `⌘`+`X` on a Mac keyboard) then `Ctrl`/`⌘`+`V` moves files, like Explorer — a short click sound confirms the cut, and `Esc` cancels it.
 - **Mouse & scroll** — independent natural-scroll for mouse and trackpad, side-button back/forward, and `Ctrl`+scroll to zoom (sent as `⌘`+scroll to apps that zoom that way, `⌘+`/`⌘−` to the rest).
 - **System Monitor** — live CPU, RAM, SSD, and temperature cells in the menu bar with smooth animation; click for details (CPU, SSD and battery temperatures).
-- **AI Usage** — a Claude Code cell next to CPU/RAM with the same session and weekly percentages `/usage` shows, read from the file Claude Code keeps on your Mac (no account, nothing leaves your Mac). Click for weekly and per-model limits, reset times, tokens, and approximate cost.
+- **AI Usage** — a Claude Code cell next to CPU/RAM with the same session and weekly percentages `/usage` shows, read from the file Claude Code keeps on your Mac (no account, nothing leaves your Mac). Click for weekly and per-model limits and reset times.
 - **Display controls** — resolution, refresh rate, rotation, set main display, power a display off, and a drag-to-arrange window.
 - **Clean Keyboard** — lock every key so you can wipe the keyboard.
 - **Glass slider** — choose how see-through the menu and windows are, from clear Liquid Glass to frosted; the menu updates as you drag.
