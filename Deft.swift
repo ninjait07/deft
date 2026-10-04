@@ -1855,6 +1855,7 @@ final class SnapManager {
     // เส้นแบ่ง
     private var dividerPool: [DividerWindow] = []
     private var dividerTimer: Timer?
+    private var frontObservers: [NSObjectProtocol] = []
 
     // MARK: Event tap
 
@@ -1882,6 +1883,17 @@ final class SnapManager {
             self?.rebuildDividers()
         }
         RunLoop.main.add(dividerTimer!, forMode: .common)
+        // มีหน้าต่างขึ้นมาอยู่ข้างหน้า (ของ Deft เอง หรือสลับแอป) → ตัดเส้นแบ่งส่วนที่ถูกบังทันที ไม่รอรอบ 2.5 วิ
+        if frontObservers.isEmpty {
+            let again: (Notification) -> Void = { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self?.rebuildDividers() }
+            }
+            for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+                frontObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main, using: again))
+            }
+            frontObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main, using: again))
+        }
         return true
     }
 
@@ -2447,25 +2459,37 @@ final class SnapManager {
         let order: Int            // ลำดับซ้อน 0 = หน้าสุด (ตามที่ระบบส่งมา)
     }
 
-    private static func onScreenWindows() -> [ScreenWindow] {
+    /// หน้าต่างบนจอ เรียงจากหน้าสุด แยกเป็นสองชุด:
+    /// - candidates: หน้าต่างปกติของแอปทั่วไป (ไม่รวมของ Deft) ที่เอามาจับคู่เป็นรอยต่อได้
+    /// - occluders: ทุกอย่างที่บังเส้นแบ่งได้ — รวมหน้าต่างของ Deft เอง (Donate, Manual, Arrange Displays)
+    ///   แอปที่ไม่มีไอคอนใน Dock หน้าต่างเล็ก และพาเนลลอย · เคยนับแค่ชุดแรก เส้นแบ่งเลยลอยทับหน้าต่างพวกนี้
+    ///   ทั้งที่มันอยู่ข้างหน้า (เส้นแบ่งอยู่ชั้น floating ซึ่งสูงกว่าหน้าต่างปกติ) · own = หน้าต่างเส้นแบ่งเอง ไม่นับ
+    private static func onScreenWindows(excluding own: Set<CGWindowID>)
+        -> (candidates: [ScreenWindow], occluders: [ScreenWindow]) {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return ([], []) }
         var regular = Set<pid_t>()
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             regular.insert(app.processIdentifier)
         }
-        var result: [ScreenWindow] = []
-        for entry in list {
-            guard (entry[kCGWindowLayer as String] as? Int) == 0,
-                  let pid = entry[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(), regular.contains(pid),
-                  let number = entry[kCGWindowNumber as String] as? UInt32,
+        let floating = Int(CGWindowLevelForKey(.floatingWindow))
+        var candidates: [ScreenWindow] = [], occluders: [ScreenWindow] = []
+        for (order, entry) in list.enumerated() {
+            guard let layer = entry[kCGWindowLayer as String] as? Int, (0...floating).contains(layer),
+                  let pid = entry[kCGWindowOwnerPID as String] as? pid_t,
+                  let number = entry[kCGWindowNumber as String] as? UInt32, !own.contains(CGWindowID(number)),
                   let b = entry[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
             let cg = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
-            guard cg.width >= 200, cg.height >= 150 else { continue }   // ตัด tooltip/แถบเล็ก ๆ
-            result.append(ScreenWindow(number: CGWindowID(number), pid: pid, rect: Geometry.toAppKit(cg),
-                                       order: result.count))
+            let window = ScreenWindow(number: CGWindowID(number), pid: pid, rect: Geometry.toAppKit(cg), order: order)
+            if (entry[kCGWindowAlpha as String] as? Double ?? 1) > 0.01, cg.width >= 40, cg.height >= 40 {
+                occluders.append(window)
+            }
+            // ตัด tooltip/แถบเล็ก ๆ ออกจากชุดที่จับคู่เป็นรอยต่อ
+            if layer == 0, pid != getpid(), regular.contains(pid), cg.width >= 200, cg.height >= 150 {
+                candidates.append(window)
+            }
         }
-        return result
+        return (candidates, occluders)
     }
 
     /// หา AXUIElement ของหน้าต่างเหล่านี้ (เรียกบน axQueue) จับคู่ด้วย pid + เฟรม
@@ -2499,8 +2523,9 @@ final class SnapManager {
         }
         // กำลังลากเส้นอยู่ = ห้ามจัดใหม่ ไม่งั้นเส้นที่จับอยู่จะถูกสลับไปคุมรอยต่ออื่นกลางคัน
         guard !dividerPool.contains(where: { $0.isDragging }) else { return }
-        let windows = Self.onScreenWindows()
-        let seams = Self.findSeams(windows)
+        let own = Set(dividerPool.filter { $0.windowNumber > 0 }.map { CGWindowID($0.windowNumber) })
+        let (windows, occluders) = Self.onScreenWindows(excluding: own)
+        let seams = Self.findSeams(windows, occluders: occluders)
         guard !seams.isEmpty else {
             hideAllDividers()
             return
@@ -2543,7 +2568,7 @@ final class SnapManager {
         let after: [(element: AXUIElement, rect: NSRect)]
     }
 
-    private static func findSeams(_ windows: [ScreenWindow]) -> [Seam] {
+    private static func findSeams(_ windows: [ScreenWindow], occluders: [ScreenWindow]) -> [Seam] {
         guard windows.count >= 2 else { return [] }
         let maxGap: CGFloat = 14
         let minWidth: CGFloat = 220
@@ -2567,7 +2592,7 @@ final class SnapManager {
                 ? NSRect(x: span.lowerBound, y: position - 6, width: span.upperBound - span.lowerBound, height: 12)
                 : NSRect(x: position - 6, y: span.lowerBound, width: 12, height: span.upperBound - span.lowerBound)
             var segments: [ClosedRange<CGFloat>] = [span]
-            for other in windows where other.order < frontmost && !ids.contains(other.number) {
+            for other in occluders where other.order < frontmost && !ids.contains(other.number) {
                 let hit = other.rect.intersection(line)
                 guard !hit.isNull, hit.width > 0, hit.height > 0 else { continue }
                 let cut = isHorizontal ? hit.minX...hit.maxX : hit.minY...hit.maxY
