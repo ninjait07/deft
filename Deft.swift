@@ -3305,6 +3305,26 @@ enum DisplayControl {
         return poweredOff.filter { entry in !online.contains { matches(entry, $0) } }
     }
 
+    /// ตอนไม่มีจอจริงเหลือเลย macOS ใส่ "จอหลอก" ไม่มีชื่อ (id ใหม่ทุกครั้ง) มาแทน — เห็นใน log เป็น usable=["#6"]
+    /// ไม่ใช่จอที่มองเห็นได้ ต้องไม่นับเป็นจอ: เคยนับแล้วทำให้ถอดจอนอกออกหมดตอนสั่งปิดจอ built-in ไว้ จอดำค้าง
+    /// (Deft เข้าใจว่ายังมีจอ → ไม่เปิดจอ built-in คืน → อีกไม่กี่วินาที macOS พาเครื่องหลับ ต้องปิด/เปิดฝาเอง)
+    static func isPlaceholder(_ info: Info) -> Bool {
+        !info.isBuiltin && info.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// มีจอจริงที่ออนไลน์อยู่ไหม (จอที่ Deft สั่งปิดไว้ไม่อยู่ในรายการของระบบ จึงไม่นับ)
+    static var hasRealDisplay: Bool { list().contains { !isPlaceholder($0) } }
+
+    /// จอเปลี่ยนแล้วไม่เหลือจอจริง = เพิ่งถอดจอนอกออกหมดตอนที่จอ built-in ถูกสั่งปิดไว้ → เปิดจอคืนทันที
+    /// ไม่รอ 2.5 วิแบบการจัดจอปกติ เพราะ macOS จะพาเครื่องหลับใน ~5 วิ · เช็คซ้ำหลัง 0.4 วิก่อนลงมือ
+    /// กันจังหวะที่ระบบกำลังสลับจอ แล้วลองซ้ำอีกรอบเผื่อครั้งแรกเร็วไป
+    static func rescueIfNoRealDisplay() {
+        guard !poweredOff.isEmpty, !hasRealDisplay else { return }
+        for delay in [0.4, 1.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { ensureVisibleDisplay() }
+        }
+    }
+
     /// รีสตาร์ท/เสียบจอแล้ว macOS เปิดจอที่ผู้ใช้เคยสั่งปิดกลับมาเอง → ปิดให้อีกครั้งตามที่ตั้งไว้
     /// ปิดเฉพาะเมื่อยังมีจออื่นเปิดอยู่ (ห้ามดับจอสุดท้าย) — ถ้าจอนั้นเป็นจอเดียวก็ปล่อยไว้ รายการยังจำอยู่
     /// ความปลอดภัย: ต้องมีจอเปิดอย่างน้อยหนึ่งจอเสมอ ถ้าไม่มีเลย (เช่นถอดจอนอกออกหมด
@@ -3313,16 +3333,14 @@ enum DisplayControl {
     @discardableResult
     static func ensureVisibleDisplay() -> Bool {
         guard !poweredOff.isEmpty, let fn = configureEnabled else { return false }
-        // นับจอที่ "วาดภาพได้จริง" (active) ไม่ใช่แค่ online — จอที่ถูก disconnect ไม่นับเป็น active
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
-        var n: UInt32 = 0
-        _ = CGGetActiveDisplayList(16, &ids, &n)
-        guard n == 0 else { return false }   // ยังมีจอเห็นภาพได้ ไม่ต้องทำอะไร
+        // จอที่ถูก disconnect ไม่อยู่ในรายการของระบบ และจอหลอกของ macOS ไม่นับ — เหลือจอจริงอยู่ก็ไม่ต้องทำอะไร
+        let online = list()
+        guard !online.contains(where: { !isPlaceholder($0) }) else { return false }
         // จอดำสนิท — เปิดจอที่ปิดไว้กลับมาทั้งหมด (ลองทุก id ที่จำไว้ เผื่อ built-in id เปลี่ยนหลังตื่น)
         var did = false
         for entry in poweredOff {
             let ok = configure { _ = fn($0, entry.id, true) }
-            knackLog("safety: no active display, re-enabling \(entry.name)#\(entry.id) → \(ok)")
+            knackLog("safety: no real display (online \(online.map { "\($0.name)#\($0.id)" })), re-enabling \(entry.name)#\(entry.id) → \(ok)")
             did = did || ok
         }
         return did
@@ -3332,7 +3350,7 @@ enum DisplayControl {
         guard !poweredOff.isEmpty else { return }
         ensureVisibleDisplay()   // กันจอดำสนิทก่อน แล้วค่อยจัดจอที่ควรปิด
         for entry in poweredOff {
-            let usable = list().filter { !$0.isMirrored }
+            let usable = list().filter { !$0.isMirrored && !isPlaceholder($0) }
             knackLog("reapply: entry=\(entry.name) usable=\(usable.map { "\($0.name)#\($0.id)" })")
             guard usable.count > 1, let live = usable.first(where: { matches(entry, $0) }) else { continue }
             if live.id != entry.id {   // id ใหม่หลังรีสตาร์ท — อัปเดตก่อนสั่งปิด
@@ -3365,7 +3383,7 @@ enum DisplayControl {
     @discardableResult
     static func powerOff(_ id: CGDirectDisplayID) -> Bool {
         guard let fn = configureEnabled else { return false }
-        let usable = list().filter { !$0.isMirrored }
+        let usable = list().filter { !$0.isMirrored && !isPlaceholder($0) }
         guard usable.count > 1, let target = usable.first(where: { $0.id == id }) else { return false }
         if target.isMain, let next = usable.first(where: { $0.id != id }) {
             makeMain(next.id)
@@ -7550,6 +7568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SnapManager.shared.rebuildDividers()
             // เสียบจอ/รีสตาร์ทแล้วจอที่เคยสั่งปิดกลับมา → รอให้ระบบจัดจอเสร็จแล้วปิดให้ซ้ำ
             knackLog("screen parameters changed")
+            DisplayControl.rescueIfNoRealDisplay()   // ถอดจอนอกออกหมดตอนปิดจอ built-in ไว้ → เปิดคืนทันที
             self.displaySettleWork?.cancel()
             let work = DispatchWorkItem {
                 DisplayControl.ensureVisibleDisplay()
@@ -8063,7 +8082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        let active = DisplayControl.list().filter { !$0.isMirrored }
+        let active = DisplayControl.list().filter { !$0.isMirrored && !DisplayControl.isPlaceholder($0) }
         for (index, display) in active.enumerated() {
             let id = display.id
             menu.addItem(row(DisplayRowView(
@@ -8289,7 +8308,7 @@ final class ArrangeCanvas: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     func reload() {
-        tiles = DisplayControl.list().filter { !$0.isMirrored }.map {
+        tiles = DisplayControl.list().filter { !$0.isMirrored && !DisplayControl.isPlaceholder($0) }.map {
             Tile(id: $0.id, name: $0.name, isMain: $0.isMain, isBuiltin: $0.isBuiltin,
                  global: $0.bounds, angle: DisplayRotation.angle(of: $0.id))
         }
