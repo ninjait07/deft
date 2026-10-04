@@ -3759,10 +3759,16 @@ enum DockItems {
 
     static func items(refreshAfter interval: CFTimeInterval = 1.0) -> [Item] {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - readAt < interval, !cache.isEmpty { return cache }
+        if now - readAt < interval { return cache }
         readAt = now
         cache = read()
         return cache
+    }
+
+    /// จอเปลี่ยน (ต่อ/ถอดจอ เปลี่ยนความละเอียด) — ตำแหน่ง Dock ที่จำไว้ใช้ไม่ได้แล้ว
+    static func invalidate() {
+        cache = []
+        readAt = 0
     }
 
     static func item(at point: CGPoint) -> Item? {
@@ -3770,11 +3776,25 @@ enum DockItems {
         items(refreshAfter: 0.3).first { $0.running && $0.frame.contains(point) }
     }
 
-    /// เคอร์เซอร์อยู่แถว ๆ Dock หรือยัง — เช็คจากค่าที่แคชไว้ ไม่ต้องคุยกับ Dock
+    /// เคอร์เซอร์อยู่แถว ๆ Dock หรือยัง
+    /// เดิมดูจากตำแหน่ง Dock ที่จำไว้อย่างเดียว และจะถาม Dock ใหม่ก็ต่อเมื่อเมาส์เข้าใกล้ตำแหน่งนั้น — พอ Dock ย้าย
+    /// (ต่อ/ถอดจอ เปลี่ยนความละเอียด ย้ายไปอีกจอหรืออีกขอบ) ตำแหน่งที่จำไว้ก็ผิดไปตลอด พรีวิวไม่ขึ้นอีกจนกว่าจะเปิดแอปใหม่
+    /// ตอนนี้: Dock อยู่ได้แค่ขอบล่าง/ซ้าย/ขวาของจอ — เมาส์อยู่ใกล้ขอบพวกนั้นแต่ไม่ตรงกับที่จำไว้ ให้ถาม Dock ใหม่
+    /// (ไม่เกินวินาทีละครั้ง) ส่วนตอนเมาส์อยู่กลางจอยังไม่ต้องคุยกับ Dock เหมือนเดิม
     static func isNearDock(_ point: CGPoint) -> Bool {
-        let known = band
-        if known.isNull { _ = items(refreshAfter: 2.0); return !band.isNull && band.insetBy(dx: -90, dy: -90).contains(point) }
-        return known.insetBy(dx: -90, dy: -90).contains(point)
+        if band.insetBy(dx: -90, dy: -90).contains(point) { return true }
+        guard nearScreenEdge(point) else { return false }
+        _ = items(refreshAfter: 1.0)
+        return band.insetBy(dx: -90, dy: -90).contains(point)
+    }
+
+    private static func nearScreenEdge(_ point: CGPoint) -> Bool {
+        let reach: CGFloat = 200
+        return NSScreen.screens.contains { screen in
+            let frame = Geometry.toCG(screen.frame)
+            guard frame.insetBy(dx: -2, dy: -2).contains(point) else { return false }
+            return point.y > frame.maxY - reach || point.x < frame.minX + reach || point.x > frame.maxX - reach
+        }
     }
 
     private static func read() -> [Item] {
@@ -7526,6 +7546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil, queue: .main
         ) { _ in
             Geometry.refresh()
+            DockItems.invalidate()
             SnapManager.shared.rebuildDividers()
             // เสียบจอ/รีสตาร์ทแล้วจอที่เคยสั่งปิดกลับมา → รอให้ระบบจัดจอเสร็จแล้วปิดให้ซ้ำ
             knackLog("screen parameters changed")
