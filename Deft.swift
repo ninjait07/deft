@@ -2995,6 +2995,9 @@ enum LanguageSwitcher {
     /// สลับไปภาษาถัดไป — ถ้ามีสองภาษาก็คือสลับไป-กลับเหมือน Windows
     static func toggle() {
         let sources = enabledSources()
+        #if DEFT_LANG_DIAG
+        if sources.count <= 1 { LangDiag.log("switch: only \(sources.count) input source enabled — nothing to switch to") }
+        #endif
         guard sources.count > 1 else { return }
         var currentID: String?
         if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() {
@@ -3003,7 +3006,24 @@ enum LanguageSwitcher {
         let index = sources.firstIndex {
             (property($0, kTISPropertyInputSourceID) as? String) == currentID
         } ?? 0
-        TISSelectInputSource(sources[(index + 1) % sources.count])
+        let next = sources[(index + 1) % sources.count]
+        #if DEFT_LANG_DIAG
+        let from = LangDiag.sourceID(), to = LangDiag.sourceID(next)
+        if LangDiag.viaShortcut {
+            if let hotkey = LangDiag.systemHotkey() {
+                LangDiag.log("switch (system shortcut \(hotkey.id), key \(hotkey.code)): \(from) → expecting \(to)")
+                LangDiag.pressChord(hotkey.code, hotkey.flags)
+                LangDiag.checkLater(expected: to)
+                return
+            }
+            LangDiag.log("switch: system shortcuts 60/61 are not enabled — using the direct method")
+        }
+        let status = TISSelectInputSource(next)
+        LangDiag.log("switch (direct): \(from) → \(to) status=\(status)")
+        LangDiag.checkLater(expected: to)
+        #else
+        TISSelectInputSource(next)
+        #endif
     }
 
     /// input source ที่ใช้อยู่ตอนนี้เป็นภาษาไทยไหม (ดูจากตัวอักษรที่ layout ให้จริง)
@@ -3028,6 +3048,162 @@ enum LanguageSwitcher {
     }
 
 }
+
+#if DEFT_LANG_DIAG
+// MARK: - รุ่นวินิจฉัย: บันทึกการกดปุ่มเปลี่ยนภาษา (เฉพาะ build ที่ตั้ง KNACK_DIAG=1) -------
+
+/// บันทึกลง ~/Library/Logs/Deft-language.log เฉพาะ "ปุ่มเปลี่ยนภาษา" (~ / Win+Space / Alt+Shift) กับ
+/// "ภาษาที่ระบบใช้อยู่" — ไม่บันทึกปุ่มอื่นและไม่บันทึกข้อความที่พิมพ์ · ไม่อยู่ในรุ่นที่แจกจริง
+enum LangDiag {
+    static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Deft-language.log")
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
+    /// ทดลอง: สลับภาษาด้วยการกดปุ่มลัดของระบบแทนการสั่งตรง — เปิด/ปิดได้จากเมนู
+    static var viaShortcut: Bool {
+        get { UserDefaults.standard.bool(forKey: "diagSwitchViaShortcut") }
+        set { UserDefaults.standard.set(newValue, forKey: "diagSwitchViaShortcut") }
+    }
+
+    static func log(_ message: String) {
+        let line = "\(clock.string(from: Date()))  \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile(); handle.write(data); try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    static func sourceID(_ source: TISInputSource? = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()) -> String {
+        guard let source, let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "?" }
+        return (Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String)
+            .replacingOccurrences(of: "com.apple.keylayout.", with: "")
+    }
+
+    private static func pref(_ key: String, _ domain: String) -> String {
+        guard let value = CFPreferencesCopyAppValue(key as CFString, domain as CFString) else { return "(not set)" }
+        return "\(value)".split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: " ")
+    }
+
+    private static func hotkey(_ id: String) -> String {
+        guard let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, "com.apple.symbolichotkeys" as CFString) as? [String: Any],
+              let entry = all[id] as? [String: Any] else { return "(not set — system default)" }
+        let enabled = (entry["enabled"] as? Bool) ?? false
+        let parameters = ((entry["value"] as? [String: Any])?["parameters"] as? [Int]) ?? []
+        return "enabled=\(enabled) parameters=\(parameters)"
+    }
+
+    static func start() {
+        // ไฟล์โตเกิน 2 MB เริ่มใหม่ จะได้ส่งกันง่าย
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int, size > 2_000_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
+        var model = [CChar](repeating: 0, count: 64)
+        var length = model.count
+        sysctlbyname("hw.model", &model, &length, nil, 0)
+        log("================ Deft \(Updater.currentVersion) (\(Updater.currentBuild)) diagnostic build started ================")
+        log("This file records only: presses of the language-switch key (~, or Space with Ctrl/Alt/Win), changes of the")
+        log("input source, and which app was in front at those moments. No other keys and no typed text are recorded.")
+        log("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString) · Mac: \(String(cString: model))")
+        log("Deft settings: autoDetectKeyboard=\(Config.perKeyboard) windowsShortcuts(manual)=\(Config.keyboardStyleWindows) languageSwitchKey=\(Int(Config.languageSwitchKey)) [0 off · 1 ~ · 2 Alt+Shift · 3 Win+Space · 4 Ctrl+Shift]")
+        log("permissions: accessibility=\(AXIsProcessTrusted()) inputMonitoring=\(KeyboardWatch.shared.accessGranted)")
+        KeyboardWatch.shared.scan()
+        log("keyboards: " + KeyboardWatch.shared.devices.map { "\($0.name) [vendor \($0.vendor), \($0.kind.rawValue)]" }.joined(separator: " · "))
+        log("input sources enabled: \(LanguageSwitcher.enabledSources().map { sourceID($0) }) · current: \(sourceID())")
+        log("system shortcut 'previous input source' (60): \(hotkey("60"))")
+        log("system shortcut 'next input source' (61): \(hotkey("61"))")
+        log("per-document input source: \(pref("AppleGlobalTextInputProperties", "com.apple.HIToolbox"))")
+        log("key repeat: InitialKeyRepeat=\(pref("InitialKeyRepeat", kCFPreferencesAnyApplication as String)) KeyRepeat=\(pref("KeyRepeat", kCFPreferencesAnyApplication as String))")
+        log("secure keyboard entry right now: \(IsSecureEventInputEnabled())")
+        log("test option 'switch via system shortcut': \(viaShortcut)")
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
+        ) { _ in log("system: input source is now \(sourceID())  (front app \(FrontApp.bundleID))") }
+        // ไม่บันทึกการสลับแอปทั่วไป — ชื่อแอปที่อยู่หน้าสุดถูกจดเฉพาะตอนกดปุ่มเปลี่ยนภาษาหรือตอนภาษาเปลี่ยนเท่านั้น
+    }
+
+    /// อีเวนต์ของปุ่มที่เป็นปุ่มเปลี่ยนภาษาได้ (ไม่ใช่ปุ่มพิมพ์ตัวอักษร)
+    static func key(type: CGEventType, event: CGEvent, code: Int) {
+        let flags = event.flags
+        var held: [String] = []
+        if flags.contains(.maskCommand) { held.append("cmd") }
+        if flags.contains(.maskControl) { held.append("ctrl") }
+        if flags.contains(.maskAlternate) { held.append("alt") }
+        if flags.contains(.maskShift) { held.append("shift") }
+        let name = code == kVK_ANSI_Grave ? "~ key" : code == kVK_ISO_Section ? "ISO section key (§)" : "space"
+        log("key: \(name) code=\(code) \(type == .keyDown ? "DOWN" : "up") held=\(held) repeat=\(event.getIntegerValueField(.keyboardEventAutorepeat))"
+            + " keyboardType=\(event.getIntegerValueField(.keyboardEventKeyboardType))"
+            + " | windowsMode=\(KeyboardStyle.windowsActive) lastKeyboard=\(KeyboardWatch.shared.lastKind.rawValue) choice=\(Int(Config.languageSwitchKey))"
+            + " | front=\(FrontApp.bundleID) secureInput=\(IsSecureEventInputEnabled()) source=\(sourceID())")
+    }
+
+    /// หลังสั่งสลับ: ดูว่าระบบเปลี่ยนตามจริงไหม และใช้เวลานานแค่ไหน
+    static func checkLater(expected: String) {
+        for delay in [0.06, 0.25, 0.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                let now = sourceID()
+                log("  after \(Int(delay * 1000)) ms: source=\(now) \(now == expected ? "✓" : "✗ expected \(expected)")")
+            }
+        }
+    }
+
+    /// ปุ่มลัดเปลี่ยนภาษาของระบบเอง: 61 = ภาษาถัดไป · 60 = ภาษาก่อนหน้า (เอาตัวที่เปิดใช้อยู่)
+    static func systemHotkey() -> (code: Int, flags: CGEventFlags, id: String)? {
+        guard let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, "com.apple.symbolichotkeys" as CFString) as? [String: Any] else { return nil }
+        for id in ["61", "60"] {
+            guard let entry = all[id] as? [String: Any], (entry["enabled"] as? Bool) == true,
+                  let parameters = (entry["value"] as? [String: Any])?["parameters"] as? [Int],
+                  parameters.count >= 3, parameters[1] != 65535 else { continue }
+            var flags = CGEventFlags()
+            if parameters[2] & 0x20000 != 0 { flags.insert(.maskShift) }
+            if parameters[2] & 0x40000 != 0 { flags.insert(.maskControl) }
+            if parameters[2] & 0x80000 != 0 { flags.insert(.maskAlternate) }
+            if parameters[2] & 0x100000 != 0 { flags.insert(.maskCommand) }
+            guard !flags.isEmpty else { continue }
+            return (parameters[1], flags, id)
+        }
+        return nil
+    }
+
+    /// กดปุ่มลัดของระบบแบบครบท่า: กดปุ่ม modifier ลงจริง ๆ ก่อน แล้วค่อยกดปุ่มหลัก แล้วปล่อยย้อนลำดับ
+    /// (ส่งแค่ปุ่มหลักพร้อม flag อย่างเดียว macOS ไม่นับเป็นปุ่มลัดเปลี่ยนภาษา — ลองแล้วบน macOS 27)
+    /// ทำบนคิวเบื้องหลัง เพราะต้องเว้นจังหวะระหว่างปุ่ม ห้ามไปหน่วง main thread ที่ event tap ใช้อยู่
+    private static let chordQueue = DispatchQueue(label: "com.nonbannawat.deft.lang-chord")
+    static func pressChord(_ code: Int, _ flags: CGEventFlags) {
+        let modifiers: [(CGEventFlags, Int)] = [(.maskControl, kVK_Control), (.maskAlternate, kVK_Option),
+                                                (.maskShift, kVK_Shift), (.maskCommand, kVK_Command)]
+        let wanted = modifiers.filter { flags.contains($0.0) }
+        chordQueue.async {
+            let source = CGEventSource(stateID: .hidSystemState)
+            func post(_ key: Int, _ down: Bool, _ held: CGEventFlags) {
+                guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down) else { return }
+                event.flags = held
+                event.setIntegerValueField(.eventSourceUserData, value: SystemActions.syntheticTag)
+                event.post(tap: .cghidEventTap)
+                usleep(20_000)
+            }
+            var held = CGEventFlags()
+            for (flag, key) in wanted { held.insert(flag); post(key, true, held) }
+            post(code, true, held)
+            post(code, false, held)
+            for (flag, key) in wanted.reversed() { held.remove(flag); post(key, false, held) }
+        }
+    }
+
+    static func reveal() {
+        if !FileManager.default.fileExists(atPath: url.path) { log("(log opened before any event)") }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+}
+#endif
 
 // MARK: - คุยกับ Finder --------------------------------------------------------
 
@@ -4240,6 +4416,9 @@ final class InputTap {
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            #if DEFT_LANG_DIAG
+            LangDiag.log("keyboard tap was switched off by macOS (\(type == .tapDisabledByTimeout ? "timeout" : "user input")) — keys pressed meanwhile were not handled; re-enabling")
+            #endif
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
         }
@@ -4288,6 +4467,13 @@ final class InputTap {
 
         if type == .keyDown { altShiftArmed = false }
 
+        #if DEFT_LANG_DIAG
+        if code == kVK_ANSI_Grave || code == kVK_ISO_Section
+            || (code == kVK_Space && (hasCommand || hasControl || hasOption)) {
+            LangDiag.key(type: type, event: event, code: code)
+        }
+        #endif
+
         // ปุ่มเปลี่ยนภาษาแบบ Windows
         if KeyboardStyle.windowsActive {
             let choice = Int(Config.languageSwitchKey)
@@ -4296,10 +4482,16 @@ final class InputTap {
             let firstPress = type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0
             // ไม่กิน Shift+` เพื่อให้ยังพิมพ์ ~ ได้
             if choice == 1, code == kVK_ANSI_Grave, !hasCommand, !hasControl, !hasOption, !hasShift {
+                #if DEFT_LANG_DIAG
+                if type == .keyDown { LangDiag.log(firstPress ? "  → Deft handles it: switching" : "  → auto-repeat, ignored") }
+                #endif
                 if firstPress { LanguageSwitcher.toggle() }
                 return true
             }
             if choice == 3, code == kVK_Space, hasCommand, !hasControl, !hasOption, !hasShift {
+                #if DEFT_LANG_DIAG
+                if type == .keyDown { LangDiag.log(firstPress ? "  → Deft handles it: switching" : "  → auto-repeat, ignored") }
+                #endif
                 if firstPress { LanguageSwitcher.toggle() }
                 return true
             }
@@ -4639,6 +4831,9 @@ final class InputTap {
             } else if altShiftArmed,
                       !now.contains(primary) || !now.contains(.maskShift) {
                 altShiftArmed = false
+                #if DEFT_LANG_DIAG
+                LangDiag.log("key: modifier combo (choice \(choice)) released | front=\(FrontApp.bundleID) → switching")
+                #endif
                 LanguageSwitcher.toggle()
             }
         }
@@ -7582,6 +7777,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Geometry.refresh()
         FrontApp.start()
         Updater.scheduleAutomatic()
+        #if DEFT_LANG_DIAG
+        LangDiag.start()
+        #endif
         #if DEFT_DEV_HOOKS
         installScreenshotHook()
         installRecorderHook()
@@ -8063,6 +8261,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        symbolName: "rectangle.portrait.and.arrow.right") {
             NSApp.terminate(nil)
         }))
+
+        #if DEFT_LANG_DIAG
+        // ---- Diagnostics (รุ่นเก็บ log เท่านั้น) ------------------------------
+        menu.addItem(separator())
+        menu.addItem(header("Diagnostics"))
+        menu.addItem(MenuToggleRow(title: "Switch via System Shortcut", isOn: LangDiag.viaShortcut,
+                                   tip: "Test: change language by pressing macOS's own input-source shortcut instead of switching directly") { value in
+            LangDiag.viaShortcut = value
+            LangDiag.log("setting changed: switch via system shortcut = \(value)")
+        })
+        menu.addItem(row(MenuActionRow(title: "Show Language Log", symbolName: "doc.text.magnifyingglass") {
+            LangDiag.reveal()
+        }))
+        #endif
 
         // เครดิตล่างสุด — นอกการ์ด
         menu.addItem(separator())

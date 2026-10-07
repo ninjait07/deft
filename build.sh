@@ -58,7 +58,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 DEV_HOOKS="-DDEFT_DEV_HOOKS"
 if [ "${KNACK_RELEASE:-0}" = "1" ]; then DEV_HOOKS=""; fi
 
-swiftc -O -swift-version 5 $DEV_HOOKS \
+# รุ่นวินิจฉัย (KNACK_DIAG=1): บันทึกการกดปุ่มเปลี่ยนภาษาลง ~/Library/Logs/Deft-language.log + แถว Diagnostics ในเมนู
+# ใช้ส่งให้ผู้ใช้ที่เจอปัญหาช่วยเก็บข้อมูล — ไม่ใช่รุ่นที่แจกทั่วไป
+DIAG=""
+if [ "${KNACK_DIAG:-0}" = "1" ]; then DIAG="-DDEFT_LANG_DIAG"; fi
+
+swiftc -O -swift-version 5 $DEV_HOOKS $DIAG \
     -target arm64-apple-macos13.0 \
     -o "$APP/Contents/MacOS/$NAME" \
     "$SRC_DIR/Deft.swift" \
