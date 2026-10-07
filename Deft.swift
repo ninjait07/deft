@@ -4291,13 +4291,16 @@ final class InputTap {
         // ปุ่มเปลี่ยนภาษาแบบ Windows
         if KeyboardStyle.windowsActive {
             let choice = Int(Config.languageSwitchKey)
+            // สลับครั้งเดียวต่อการกดหนึ่งครั้ง: กดค้างนานนิดเดียวคีย์บอร์ดจะส่ง keyDown ซ้ำ (auto-repeat) ถ้าสลับทุกครั้ง
+            // ภาษาจะเด้งไปแล้วเด้งกลับ — ดูเหมือนกดแล้วไม่เปลี่ยน และป้ายภาษาตรงจุดพิมพ์ค้างไม่ตรงกับเมนูบาร์
+            let firstPress = type == .keyDown && event.getIntegerValueField(.keyboardEventAutorepeat) == 0
             // ไม่กิน Shift+` เพื่อให้ยังพิมพ์ ~ ได้
             if choice == 1, code == kVK_ANSI_Grave, !hasCommand, !hasControl, !hasOption, !hasShift {
-                if type == .keyDown { LanguageSwitcher.toggle() }
+                if firstPress { LanguageSwitcher.toggle() }
                 return true
             }
             if choice == 3, code == kVK_Space, hasCommand, !hasControl, !hasOption, !hasShift {
-                if type == .keyDown { LanguageSwitcher.toggle() }
+                if firstPress { LanguageSwitcher.toggle() }
                 return true
             }
         }
