@@ -2993,37 +2993,101 @@ enum LanguageSwitcher {
     }
 
     /// สลับไปภาษาถัดไป — ถ้ามีสองภาษาก็คือสลับไป-กลับเหมือน Windows
+    ///
+    /// วิธีหลัก: กดปุ่มลัดเปลี่ยนภาษาของ macOS เอง ให้ระบบเป็นคนสลับ · เดิมสั่ง TISSelectInputSource ตรง ๆ
+    /// ซึ่งบนเครื่องที่เปิด "Automatically switch to a document's input source" macOS จะดีดกลับไปภาษาที่ช่องพิมพ์นั้น
+    /// จำไว้ภายใน ~13 ms (เห็นใน log จากผู้ใช้: สั่งเป็นไทย → ระบบแจ้งไทย → แจ้งอังกฤษทันที) กด ~ แล้วภาษาไม่เปลี่ยน
+    /// และป้ายภาษาตรงจุดพิมพ์ไม่ตรงกับเมนูบาร์ · ปุ่มลัดของระบบไม่มีอาการนี้ (17/17 ครั้งใน log เดียวกัน)
+    /// ถ้าปุ่มลัดของระบบถูกปิดไว้ หรือกดแล้ว 0.4 วิภาษายังไม่เปลี่ยน (เช่นแอปข้างหน้ากินปุ่มไปเอง) ค่อยสั่งตรงแบบเดิม
     static func toggle() {
         let sources = enabledSources()
         #if DEFT_LANG_DIAG
         if sources.count <= 1 { LangDiag.log("switch: only \(sources.count) input source enabled — nothing to switch to") }
         #endif
         guard sources.count > 1 else { return }
-        var currentID: String?
-        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() {
-            currentID = property(current, kTISPropertyInputSourceID) as? String
-        }
-        let index = sources.firstIndex {
-            (property($0, kTISPropertyInputSourceID) as? String) == currentID
-        } ?? 0
+        let before = currentID()
+        let index = sources.firstIndex { (property($0, kTISPropertyInputSourceID) as? String) == before } ?? 0
         let next = sources[(index + 1) % sources.count]
-        #if DEFT_LANG_DIAG
-        let from = LangDiag.sourceID(), to = LangDiag.sourceID(next)
-        if LangDiag.viaShortcut {
-            if let hotkey = LangDiag.systemHotkey() {
-                LangDiag.log("switch (system shortcut \(hotkey.id), key \(hotkey.code)): \(from) → expecting \(to)")
-                LangDiag.pressChord(hotkey.code, hotkey.flags)
-                LangDiag.checkLater(expected: to)
-                return
-            }
-            LangDiag.log("switch: system shortcuts 60/61 are not enabled — using the direct method")
+        attempt += 1
+        let mine = attempt
+
+        guard let hotkey = systemHotkey() else {
+            let status = TISSelectInputSource(next)
+            #if DEFT_LANG_DIAG
+            LangDiag.log("switch (direct — system shortcuts 60/61 are off): \(LangDiag.sourceID()) → \(LangDiag.sourceID(next)) status=\(status)")
+            LangDiag.checkLater(expected: LangDiag.sourceID(next))
+            #else
+            _ = status
+            #endif
+            return
         }
-        let status = TISSelectInputSource(next)
-        LangDiag.log("switch (direct): \(from) → \(to) status=\(status)")
-        LangDiag.checkLater(expected: to)
-        #else
-        TISSelectInputSource(next)
+        #if DEFT_LANG_DIAG
+        LangDiag.log("switch (system shortcut \(hotkey.id), key \(hotkey.code)): \(LangDiag.sourceID()) → expecting \(LangDiag.sourceID(next))")
+        LangDiag.checkLater(expected: LangDiag.sourceID(next))
         #endif
+        pressChord(hotkey.code, hotkey.flags)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard mine == attempt, currentID() == before else { return }
+            let status = TISSelectInputSource(next)
+            #if DEFT_LANG_DIAG
+            LangDiag.log("  system shortcut had no effect after 400 ms → direct select, status=\(status)")
+            #else
+            _ = status
+            #endif
+        }
+    }
+
+    private static var attempt = 0
+
+    private static func currentID() -> String? {
+        guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return nil }
+        return property(current, kTISPropertyInputSourceID) as? String
+    }
+
+    /// ปุ่มลัดเปลี่ยนภาษาของระบบ (System Settings ▸ Keyboard ▸ Keyboard Shortcuts ▸ Input Sources) ตัวที่เปิดใช้อยู่
+    /// 61 = "Select next source in Input menu" (วนทุกภาษา) · 60 = "Select the previous input source"
+    /// ใช้เฉพาะเมื่อระบบบันทึกไว้ชัด ๆ ว่าเปิดอยู่ — ถ้าเดาแล้วผิด ปุ่มจะไปตกที่แอปข้างหน้าแทน
+    static func systemHotkey() -> (code: Int, flags: CGEventFlags, id: String)? {
+        guard let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString,
+                                                  "com.apple.symbolichotkeys" as CFString) as? [String: Any] else { return nil }
+        for id in ["61", "60"] {
+            guard let entry = all[id] as? [String: Any], (entry["enabled"] as? Bool) == true,
+                  let parameters = (entry["value"] as? [String: Any])?["parameters"] as? [Int],
+                  parameters.count >= 3, parameters[1] != 65535 else { continue }
+            var flags = CGEventFlags()
+            if parameters[2] & 0x20000 != 0 { flags.insert(.maskShift) }
+            if parameters[2] & 0x40000 != 0 { flags.insert(.maskControl) }
+            if parameters[2] & 0x80000 != 0 { flags.insert(.maskAlternate) }
+            if parameters[2] & 0x100000 != 0 { flags.insert(.maskCommand) }
+            guard !flags.isEmpty else { continue }
+            return (parameters[1], flags, id)
+        }
+        return nil
+    }
+
+    /// กดปุ่มลัดของระบบแบบครบท่า: กดปุ่ม modifier ลงจริง ๆ ก่อน แล้วปุ่มหลัก แล้วปล่อยย้อนลำดับ
+    /// (ส่งแค่ปุ่มหลักพร้อม flag อย่างเดียว macOS ไม่นับเป็นปุ่มลัดเปลี่ยนภาษา — ลองแล้วบน macOS 27)
+    /// เว้น 5 ms ระหว่างปุ่ม (ลอง 0–20 ms ได้ผลทุกค่า) ทำบนคิวเบื้องหลัง ไม่หน่วง main thread ที่ event tap ใช้อยู่
+    private static let chordQueue = DispatchQueue(label: "com.nonbannawat.deft.language-chord", qos: .userInteractive)
+    private static func pressChord(_ code: Int, _ flags: CGEventFlags) {
+        let modifiers: [(CGEventFlags, Int)] = [(.maskControl, kVK_Control), (.maskAlternate, kVK_Option),
+                                                (.maskShift, kVK_Shift), (.maskCommand, kVK_Command)]
+        let wanted = modifiers.filter { flags.contains($0.0) }
+        chordQueue.async {
+            let source = CGEventSource(stateID: .hidSystemState)
+            func post(_ key: Int, _ down: Bool, _ held: CGEventFlags) {
+                guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down) else { return }
+                event.flags = held
+                event.setIntegerValueField(.eventSourceUserData, value: SystemActions.syntheticTag)
+                event.post(tap: .cghidEventTap)
+                usleep(5_000)
+            }
+            var held = CGEventFlags()
+            for (flag, key) in wanted { held.insert(flag); post(key, true, held) }
+            post(code, true, held)
+            post(code, false, held)
+            for (flag, key) in wanted.reversed() { held.remove(flag); post(key, false, held) }
+        }
     }
 
     /// input source ที่ใช้อยู่ตอนนี้เป็นภาษาไทยไหม (ดูจากตัวอักษรที่ layout ให้จริง)
@@ -3064,12 +3128,6 @@ enum LangDiag {
         f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         return f
     }()
-
-    /// ทดลอง: สลับภาษาด้วยการกดปุ่มลัดของระบบแทนการสั่งตรง — เปิด/ปิดได้จากเมนู
-    static var viaShortcut: Bool {
-        get { UserDefaults.standard.bool(forKey: "diagSwitchViaShortcut") }
-        set { UserDefaults.standard.set(newValue, forKey: "diagSwitchViaShortcut") }
-    }
 
     static func log(_ message: String) {
         let line = "\(clock.string(from: Date()))  \(message)\n"
@@ -3122,7 +3180,6 @@ enum LangDiag {
         log("per-document input source: \(pref("AppleGlobalTextInputProperties", "com.apple.HIToolbox"))")
         log("key repeat: InitialKeyRepeat=\(pref("InitialKeyRepeat", kCFPreferencesAnyApplication as String)) KeyRepeat=\(pref("KeyRepeat", kCFPreferencesAnyApplication as String))")
         log("secure keyboard entry right now: \(IsSecureEventInputEnabled())")
-        log("test option 'switch via system shortcut': \(viaShortcut)")
 
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
@@ -3152,49 +3209,6 @@ enum LangDiag {
                 let now = sourceID()
                 log("  after \(Int(delay * 1000)) ms: source=\(now) \(now == expected ? "✓" : "✗ expected \(expected)")")
             }
-        }
-    }
-
-    /// ปุ่มลัดเปลี่ยนภาษาของระบบเอง: 61 = ภาษาถัดไป · 60 = ภาษาก่อนหน้า (เอาตัวที่เปิดใช้อยู่)
-    static func systemHotkey() -> (code: Int, flags: CGEventFlags, id: String)? {
-        guard let all = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, "com.apple.symbolichotkeys" as CFString) as? [String: Any] else { return nil }
-        for id in ["61", "60"] {
-            guard let entry = all[id] as? [String: Any], (entry["enabled"] as? Bool) == true,
-                  let parameters = (entry["value"] as? [String: Any])?["parameters"] as? [Int],
-                  parameters.count >= 3, parameters[1] != 65535 else { continue }
-            var flags = CGEventFlags()
-            if parameters[2] & 0x20000 != 0 { flags.insert(.maskShift) }
-            if parameters[2] & 0x40000 != 0 { flags.insert(.maskControl) }
-            if parameters[2] & 0x80000 != 0 { flags.insert(.maskAlternate) }
-            if parameters[2] & 0x100000 != 0 { flags.insert(.maskCommand) }
-            guard !flags.isEmpty else { continue }
-            return (parameters[1], flags, id)
-        }
-        return nil
-    }
-
-    /// กดปุ่มลัดของระบบแบบครบท่า: กดปุ่ม modifier ลงจริง ๆ ก่อน แล้วค่อยกดปุ่มหลัก แล้วปล่อยย้อนลำดับ
-    /// (ส่งแค่ปุ่มหลักพร้อม flag อย่างเดียว macOS ไม่นับเป็นปุ่มลัดเปลี่ยนภาษา — ลองแล้วบน macOS 27)
-    /// ทำบนคิวเบื้องหลัง เพราะต้องเว้นจังหวะระหว่างปุ่ม ห้ามไปหน่วง main thread ที่ event tap ใช้อยู่
-    private static let chordQueue = DispatchQueue(label: "com.nonbannawat.deft.lang-chord")
-    static func pressChord(_ code: Int, _ flags: CGEventFlags) {
-        let modifiers: [(CGEventFlags, Int)] = [(.maskControl, kVK_Control), (.maskAlternate, kVK_Option),
-                                                (.maskShift, kVK_Shift), (.maskCommand, kVK_Command)]
-        let wanted = modifiers.filter { flags.contains($0.0) }
-        chordQueue.async {
-            let source = CGEventSource(stateID: .hidSystemState)
-            func post(_ key: Int, _ down: Bool, _ held: CGEventFlags) {
-                guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down) else { return }
-                event.flags = held
-                event.setIntegerValueField(.eventSourceUserData, value: SystemActions.syntheticTag)
-                event.post(tap: .cghidEventTap)
-                usleep(20_000)
-            }
-            var held = CGEventFlags()
-            for (flag, key) in wanted { held.insert(flag); post(key, true, held) }
-            post(code, true, held)
-            post(code, false, held)
-            for (flag, key) in wanted.reversed() { held.remove(flag); post(key, false, held) }
         }
     }
 
@@ -8266,11 +8280,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ---- Diagnostics (รุ่นเก็บ log เท่านั้น) ------------------------------
         menu.addItem(separator())
         menu.addItem(header("Diagnostics"))
-        menu.addItem(MenuToggleRow(title: "Switch via System Shortcut", isOn: LangDiag.viaShortcut,
-                                   tip: "Test: change language by pressing macOS's own input-source shortcut instead of switching directly") { value in
-            LangDiag.viaShortcut = value
-            LangDiag.log("setting changed: switch via system shortcut = \(value)")
-        })
         menu.addItem(row(MenuActionRow(title: "Show Language Log", symbolName: "doc.text.magnifyingglass") {
             LangDiag.reveal()
         }))
