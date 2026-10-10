@@ -7,7 +7,8 @@
 #
 #   ตัวแปรสภาพแวดล้อม:
 #     KNACK_VERSION=4.1 KNACK_BUILD=5   เลขรุ่นที่ใส่ใน Info.plist (ค่าเริ่มต้น 1.0 / 1)
-#     KNACK_RELEASE=1                    เซ็นแบบส่ง notarize: hardened runtime + timestamp
+#     KNACK_RELEASE=1                    เซ็นแบบส่ง notarize: hardened runtime + timestamp · build เป็น Universal
+#     KNACK_ARCHS="arm64 x86_64"         สถาปัตยกรรมที่จะคอมไพล์ (ค่าเริ่มต้น: เครื่องนี้ / Universal ตอน release)
 #     KNACK_APP=/path/Deft.app           ตำแหน่งแอปที่จะสร้าง (ค่าเริ่มต้น /Applications/Deft.app — ทับตัวที่ติดตั้งไว้
 #                                        ให้ในเครื่องมี Deft ตัวเดียว Open at Login จะได้ไม่ไปเปิดตัวเก่า)
 #
@@ -63,11 +64,28 @@ if [ "${KNACK_RELEASE:-0}" = "1" ]; then DEV_HOOKS=""; fi
 DIAG=""
 if [ "${KNACK_DIAG:-0}" = "1" ]; then DIAG="-DDEFT_LANG_DIAG"; fi
 
-swiftc -O -swift-version 5 $DEV_HOOKS $DIAG \
-    -target arm64-apple-macos13.0 \
-    -o "$APP/Contents/MacOS/$NAME" \
-    "$SRC_DIR/Deft.swift" \
-    -framework Cocoa -framework Carbon -framework ApplicationServices -framework ScreenCaptureKit
+# สถาปัตยกรรม: รุ่นที่แจก (KNACK_RELEASE=1) เป็น Universal — ไฟล์เดียวใช้ได้ทั้ง Apple Silicon และ Intel
+# dev build คอมไพล์เฉพาะของเครื่องนี้ จะได้ไม่ต้องรอสองรอบ · กำหนดเองได้ด้วย KNACK_ARCHS="arm64 x86_64"
+ARCHS="${KNACK_ARCHS:-}"
+if [ -z "$ARCHS" ]; then
+    if [ "${KNACK_RELEASE:-0}" = "1" ]; then ARCHS="arm64 x86_64"; else ARCHS="$(uname -m)"; fi
+fi
+SLICES=()
+for ARCH in $ARCHS; do
+    echo "    $ARCH"
+    swiftc -O -swift-version 5 $DEV_HOOKS $DIAG \
+        -target "$ARCH-apple-macos13.0" \
+        -o "$APP/Contents/MacOS/$NAME.$ARCH" \
+        "$SRC_DIR/Deft.swift" \
+        -framework Cocoa -framework Carbon -framework ApplicationServices -framework ScreenCaptureKit
+    SLICES+=("$APP/Contents/MacOS/$NAME.$ARCH")
+done
+if [ "${#SLICES[@]}" -gt 1 ]; then
+    lipo -create "${SLICES[@]}" -output "$APP/Contents/MacOS/$NAME"
+    rm -f "${SLICES[@]}"
+else
+    mv "${SLICES[0]}" "$APP/Contents/MacOS/$NAME"
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
