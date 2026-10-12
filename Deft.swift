@@ -7962,6 +7962,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // ให้ macOS จำตำแหน่งไอคอนบนเมนูบาร์ไว้ข้ามการเปิดแอป (ช่อง monitor มีชื่อจำอยู่แล้ว) — ไม่งั้นทุกครั้งที่เปิด
+        // ไอคอนถูกวางใหม่ แล้วไอคอนของแอป/ระบบอื่นแทรกเข้ามาระหว่างไอคอน Deft กับช่อง monitor ได้
+        statusItem.autosaveName = "DeftMain"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggleMenu)
         statusItem.button?.sendAction(on: [.leftMouseDown])
