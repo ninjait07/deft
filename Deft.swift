@@ -6431,7 +6431,8 @@ enum DeviceBatteries {
             devices.append(Device(id: id, name: name, symbol: symbol(isMac: isMac, category: info["Accessory Category"] as? String),
                                   percent: percent, charging: charging))
         }
-        return devices
+        // อุปกรณ์เสริมก่อน แล้วปิดท้ายด้วย Mac เอง — บนเมนูบาร์ช่องของ Mac จึงอยู่ขวาสุดของโซนแบตเตอรี่
+        return devices.filter { !$0.isMac } + devices.filter(\.isMac)
     }
 
     private static func symbol(isMac: Bool, category: String?) -> String {
