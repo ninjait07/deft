@@ -53,7 +53,7 @@ Deft is a lightweight macOS menu-bar app that brings the window-management and k
 2. Open it and drag **Deft** to Applications.
 3. Launch Deft and grant the permissions it asks for (see below).
 
-The app is signed with a Developer ID and notarized by Apple, so it opens without security warnings.
+The app is signed with a Developer ID and notarized by Apple, so it opens without security warnings. One download runs on both Apple Silicon and Intel Macs (macOS 13 or later); Intel support is new, so reports are welcome.
 
 Or with Homebrew:
 
