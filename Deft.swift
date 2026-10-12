@@ -122,10 +122,14 @@ enum Config {
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
     @StoredBool(key: "monitorTemp", fallback: true)          static var monitorTemp: Bool
-    @StoredBool(key: "monitorBattery", fallback: false)      static var monitorBattery: Bool
+    /// อุปกรณ์ที่เลือกให้ขึ้นช่องแบตเตอรี่บนเมนูบาร์: id → ชื่อ (เก็บชื่อไว้โชว์ในเมนูตอนอุปกรณ์นั้นไม่ได้ต่ออยู่)
+    static var batteryDevices: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "batteryDevices") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "batteryDevices") }
+    }
     /// ความขุ่นของกระจกใต้ตัวหนังสือ (เมนู, Donate, Arrange Displays) — 0 = ใสสุด · 1 = เกือบทึบ
     @StoredNumber(key: "glassOpacity", fallback: 0.5)        static var glassOpacity: CGFloat
-    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp || monitorBattery }
+    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp || !batteryDevices.isEmpty }
     /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
     @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
     /// ค่างาน ($ เทียบราคา API) ที่ถือเป็น 100% ของหน้าต่าง 5 ชม. — ได้จากการเทียบกับ /usage (0 = อัตโนมัติ)
@@ -3799,7 +3803,7 @@ enum MasterSwitch {
     case windowsSnap, livePreview
     case windowsShortcuts, autoKeyboard, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
-    case monitorCPU, monitorRAM, monitorSSD, monitorTemp, monitorBattery, aiUsage
+    case monitorCPU, monitorRAM, monitorSSD, monitorTemp, aiUsage
     case launchAtLogin
 
     var isOn: Bool {
@@ -3816,7 +3820,6 @@ enum MasterSwitch {
         case .monitorRAM:       return Config.monitorRAM
         case .monitorSSD:       return Config.monitorSSD
         case .monitorTemp:      return Config.monitorTemp
-        case .monitorBattery:   return Config.monitorBattery
         case .aiUsage:          return Config.aiUsage
         case .launchAtLogin:    return LoginItem.isEnabled
         }
@@ -3869,9 +3872,6 @@ enum MasterSwitch {
             SystemMonitor.shared.refresh()
         case .monitorTemp:
             Config.monitorTemp = value
-            SystemMonitor.shared.refresh()
-        case .monitorBattery:
-            Config.monitorBattery = value
             SystemMonitor.shared.refresh()
         case .aiUsage:
             Config.aiUsage = value
@@ -6056,6 +6056,7 @@ final class MonitorCellsView: NSView {
         var prefix = ""             // "≈" ตอนเป็นค่าประมาณ
         var celsius = false         // แสดงเป็นองศา (percent = Thermal.percent ของอุณหภูมิ)
         var lowIsBad = false        // แบตเตอรี่: ยิ่งน้อยยิ่งแย่ — ส้ม ≤20% แดง ≤10% (ช่องอื่นเตือนตอนค่าสูง)
+        var zone = 0                // 0 เครื่อง · 1 แบตเตอรี่ · 2 AI — ระหว่างโซนเว้นช่องกว้างขึ้นและมีเส้นคั่น
 
         /// ถึงระดับเตือนสีแดง (แถบหายใจ ตัวเลขแดง)
         func critical(_ level: Int) -> Bool { lowIsBad ? level <= 10 : level >= 85 }
@@ -6122,9 +6123,18 @@ final class MonitorCellsView: NSView {
     static let gap: CGFloat = 4
     static let inset: CGFloat = 4
 
-    static func width(for count: Int) -> CGFloat {
-        guard count > 0 else { return 0 }
-        return inset * 2 + CGFloat(count) * cellWidth + CGFloat(count - 1) * gap
+    static let zoneGap: CGFloat = 13    // ช่องว่างระหว่างโซน (มีเส้นคั่นบาง ๆ ตรงกลาง)
+
+    /// ตำแหน่ง x ของแต่ละช่อง + ความกว้างรวม — ช่องที่เปลี่ยนโซนเว้นห่างกว่าปกติ
+    static func layout(_ cells: [Cell]) -> (xs: [CGFloat], width: CGFloat) {
+        var xs: [CGFloat] = []
+        var x = inset
+        for (i, cell) in cells.enumerated() {
+            if i > 0 { x += cell.zone != cells[i - 1].zone ? zoneGap : gap }
+            xs.append(x)
+            x += cellWidth
+        }
+        return (xs, cells.isEmpty ? 0 : x + inset)
     }
 
     private static let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
@@ -6146,8 +6156,13 @@ final class MonitorCellsView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let y = (bounds.height - Self.cellHeight) / 2
+        let xs = Self.layout(cells).xs
         for (index, cell) in cells.enumerated() {
-            let x = Self.inset + CGFloat(index) * (Self.cellWidth + Self.gap)
+            let x = xs[index]
+            if index > 0, cell.zone != cells[index - 1].zone {   // เส้นคั่นโซน
+                NSColor.labelColor.withAlphaComponent(0.28).setFill()
+                NSRect(x: x - Self.zoneGap / 2 - 0.5, y: bounds.midY - 6, width: 1, height: 12).fill()
+            }
             let rect = NSRect(x: x, y: y, width: Self.cellWidth, height: Self.cellHeight)
             let shape = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
 
@@ -6377,10 +6392,12 @@ final class MonitorTilesRow: MenuRowView {
 /// ของผู้ผลิตเองมักไม่รายงาน
 enum DeviceBatteries {
     struct Device {
+        let id: String              // คงที่ต่ออุปกรณ์ (ใช้จำว่าเลือกตัวไหนขึ้นเมนูบาร์)
         let name: String
         let symbol: String
         let percent: Int
         let charging: Bool
+        var isMac: Bool { symbol == "laptopcomputer" }
     }
 
     /// IOPSCopyPowerSourcesByType(0) = ทุกแหล่งรวมอุปกรณ์เสริม · ตัว public (IOPSCopyPowerSourcesInfo) ให้แค่แบตของเครื่อง
@@ -6403,13 +6420,15 @@ enum DeviceBatteries {
             let isMac = (info["Type"] as? String) == "InternalBattery"
             var name = (info["Name"] as? String) ?? ""
             if isMac { name = "This Mac" } else if name.isEmpty { name = (info["Accessory Category"] as? String) ?? "Device" }
+            var id = isMac ? "this-mac" : (info["Accessory Identifier"] as? String) ?? name
             // หูฟังที่รายงานแยกข้าง/เคส (AirPods): ต่อท้ายชื่อด้วย L / R / Case
             if let part = info["Part Identifier"] as? String, part != "Single" {
                 name += "  ·  " + (part == "Left" ? "L" : part == "Right" ? "R" : part)
+                id += "#" + part
             }
             let charging = (info["Is Charging"] as? Bool) == true
                 || (isMac && (info["Power Source State"] as? String) == "AC Power")
-            devices.append(Device(name: name, symbol: symbol(isMac: isMac, category: info["Accessory Category"] as? String),
+            devices.append(Device(id: id, name: name, symbol: symbol(isMac: isMac, category: info["Accessory Category"] as? String),
                                   percent: percent, charging: charging))
         }
         return devices
@@ -6524,10 +6543,9 @@ final class SystemMonitor: NSObject {
     func redraw() { if item != nil { cellsView.cells = cells() } }
 
     /// ความกว้างคงที่ตามจำนวนช่องที่เปิด ไม่ขึ้นกับตัวเลขข้างใน
-    private func layout(count known: Int? = nil) {
+    private func layout(_ known: [MonitorCellsView.Cell]? = nil) {
         guard let item, let button = item.button else { return }
-        let count = known ?? cells().count
-        item.length = MonitorCellsView.width(for: count)
+        item.length = MonitorCellsView.layout(known ?? cells()).width
         cellsView.frame = button.bounds
         cellsView.autoresizingMask = [.width, .height]
     }
@@ -6615,17 +6633,18 @@ final class SystemMonitor: NSObject {
 
         // แบตเตอรี่เปลี่ยนช้า อ่านทุก 30 วิพอ (อุปกรณ์เพิ่งต่อ/ถอดจะเห็นภายในครึ่งนาที)
         let now = CFAbsoluteTimeGetCurrent()
-        if Config.monitorBattery, now - batteriesReadAt >= 30 {
+        let wantsBatteries = !Config.batteryDevices.isEmpty
+        if wantsBatteries, now - batteriesReadAt >= 30 {
             batteriesReadAt = now
             next.batteries = DeviceBatteries.read()
         } else {
-            next.batteries = Config.monitorBattery ? sample.batteries : []
-            if !Config.monitorBattery { batteriesReadAt = 0 }
+            next.batteries = wantsBatteries ? sample.batteries : []
+            if !wantsBatteries { batteriesReadAt = 0 }
         }
 
         sample = next
         let updated = cells()
-        if updated.count != cellsView.cells.count { layout(count: updated.count) }   // ช่องแบตโผล่/หายตามอุปกรณ์ที่ต่ออยู่
+        if updated.map(\.zone) != cellsView.cells.map(\.zone) { layout(updated) }   // ช่องแบตโผล่/หายตามอุปกรณ์ที่ต่ออยู่
         cellsView.cells = updated
         tilesRow?.tiles = tiles()
     }
@@ -6792,17 +6811,16 @@ final class SystemMonitor: NSObject {
             if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { level = max(level, 85) }
             result.append(.init(symbol: "thermometer.medium", percent: level, celsius: true))
         }
-        // แบตเตอรี่: ตัวที่ "เหลือน้อยที่สุด" ในบรรดาอุปกรณ์ที่ต่ออยู่ (ตัวที่ต้องรีบชาร์จก่อน) พร้อมไอคอนของอุปกรณ์นั้น
-        // ไม่มีอุปกรณ์เสริมเลยจึงใช้แบตของ Mac เอง · ไม่มีอะไรรายงานแบตก็ไม่มีช่องนี้
-        if Config.monitorBattery {
-            let accessories = sample.batteries.filter { $0.symbol != "laptopcomputer" }
-            if let lowest = (accessories.isEmpty ? sample.batteries : accessories).min(by: { $0.percent < $1.percent }) {
-                result.append(.init(symbol: lowest.symbol, percent: lowest.percent, lowIsBad: true))
+        // โซนแบตเตอรี่: หนึ่งช่องต่ออุปกรณ์ที่ผู้ใช้เปิดไว้ในเมนูและกำลังต่ออยู่ (ไอคอนตามชนิดอุปกรณ์)
+        let chosen = Config.batteryDevices
+        if !chosen.isEmpty {
+            for device in sample.batteries where chosen[device.id] != nil {
+                result.append(.init(symbol: device.symbol, percent: device.percent, lowIsBad: true, zone: 1))
             }
         }
         if AIUsage.shared.showing {
             result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded()),
-                                prefix: AIUsage.shared.isLive ? "" : "≈"))
+                                prefix: AIUsage.shared.isLive ? "" : "≈", zone: 2))
         }
         return result
     }
@@ -6856,7 +6874,7 @@ final class SystemMonitor: NSObject {
         MasterSwitch.monitorRAM.set(false)
         MasterSwitch.monitorSSD.set(false)
         MasterSwitch.monitorTemp.set(false)
-        MasterSwitch.monitorBattery.set(false)
+        Config.batteryDevices = [:]
         MasterSwitch.aiUsage.set(false)
         AppDelegate.shared?.refreshMenu()
     }
@@ -7041,8 +7059,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
             ("CPU · RAM · SSD · Temperature",
-             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging). Turn on Battery to keep the lowest of those devices on the menu bar too.",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ) เปิดสวิตช์ Battery เพื่อให้อุปกรณ์ที่แบตเหลือน้อยที่สุดขึ้นบนแถบเมนูด้วย"),
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging). The Battery section of Deft's menu lists every device it finds; switch one on and it gets its own cell on the menu bar, grouped in a separate zone.",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ) หมวด Battery ในเมนูของ Deft จะแสดงอุปกรณ์ทุกตัวที่เจอ เปิดสวิตช์ของตัวไหน ตัวนั้นก็ขึ้นเป็นช่องบนแถบเมนู แยกเป็นโซนของตัวเอง"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
@@ -8419,7 +8437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// หัวข้อกลุ่มในเมนู — ตัวเล็กสีจาง คั่นของให้อ่านเป็นกลุ่มได้
     private static let sectionIcons: [String: String] = [
         "Windows": "macwindow", "Keyboard": "keyboard", "Mouse": "computermouse",
-        "System Monitor": "chart.bar.xaxis", "AI Usage": "sparkles", "Display": "display", "Glass": "circle.lefthalf.filled", "System": "gearshape"]
+        "System Monitor": "chart.bar.xaxis", "Battery": "battery.75percent", "AI Usage": "sparkles", "Display": "display", "Glass": "circle.lefthalf.filled", "System": "gearshape"]
     private func header(_ text: String, badge: String? = nil) -> MenuRowView {
         MenuHeaderLabelRow(symbol: Self.sectionIcons[text] ?? "circle", text: text, badge: badge)
     }
@@ -8524,8 +8542,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(toggle("Temperature", .monitorTemp,
                                 tip: "Hottest CPU core in °C, read from the chip's own sensors. Turns orange above ~81°C and red above ~93°C. Click for SSD and battery temperatures"))
         }
-        menu.addItem(toggle("Battery", .monitorBattery,
-                            tip: "Battery of the connected device that is lowest (mouse, keyboard, headphones), or this Mac if there is none. Orange at 20%, red at 10%. Click for every device"))
+
+        // ---- Battery -------------------------------------------------------
+        // อุปกรณ์ที่ Deft เห็นตอนเปิดเมนู (เครื่องนี้ + ทุกตัวที่รายงานแบตให้ macOS) เปิด/ปิดช่องบนเมนูบาร์ได้ทีละตัว
+        // ตัวที่เคยเปิดไว้แต่ตอนนี้ไม่ได้ต่ออยู่ยังอยู่ในรายการ (จะได้ปิดได้) พอกลับมาต่อ ช่องก็กลับมาเอง
+        menu.addItem(separator())
+        menu.addItem(header("Battery"))
+        let detected = DeviceBatteries.read()
+        var chosen = Config.batteryDevices
+        for device in detected {
+            if chosen[device.id] != nil, chosen[device.id] != device.name { chosen[device.id] = device.name; Config.batteryDevices = chosen }
+            menu.addItem(MenuToggleRow(title: device.name, isOn: chosen[device.id] != nil,
+                                       tip: "Show \(device.name)'s battery (\(device.percent)% now) on the menu bar. Orange at 20%, red at 10%",
+                                       indent: 22, leadingSymbol: device.symbol) { on in
+                var next = Config.batteryDevices
+                next[device.id] = on ? device.name : nil
+                Config.batteryDevices = next
+                SystemMonitor.shared.refresh()
+            })
+        }
+        for (id, name) in chosen.sorted(by: { $0.value < $1.value }) where !detected.contains(where: { $0.id == id }) {
+            menu.addItem(MenuToggleRow(title: name + "  (not connected)", isOn: true,
+                                       tip: "Its battery cell comes back when the device reconnects. Turn off to forget it",
+                                       indent: 22) { on in
+                guard !on else { return }
+                var next = Config.batteryDevices
+                next[id] = nil
+                Config.batteryDevices = next
+                SystemMonitor.shared.refresh()
+                DispatchQueue.main.async { [weak self] in self?.refreshMenu() }
+            })
+        }
+        if detected.isEmpty && chosen.isEmpty { menu.addItem(note("No device reports a battery right now")) }
 
         // ---- AI Usage ------------------------------------------------------
         menu.addItem(separator())
