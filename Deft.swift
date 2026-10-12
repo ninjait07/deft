@@ -5217,16 +5217,20 @@ final class MenuToggleRow: MenuRowView {
     private let title: String
     private let indent: CGFloat
     private let leadingSymbol: String?
+    /// true = ไอคอนเป็นตัวบอกสถานะ (เหลือง + แบบทึบตอนเปิด เช่นดาวของ "Make main display")
+    /// false = ไอคอนแค่บอกว่าแถวนี้คืออะไร (ชนิดอุปกรณ์) สีเทาเหมือนไอคอนอื่นในเมนู ไม่เปลี่ยนตามสวิตช์
+    private let iconShowsState: Bool
     private let apply: (Bool) -> Void
     private var on: Bool
     private var hovered = false
 
     init(title: String, isOn: Bool, tip: String?, indent: CGFloat = 0, leadingSymbol: String? = nil,
-         apply: @escaping (Bool) -> Void) {
+         iconShowsState: Bool = true, apply: @escaping (Bool) -> Void) {
         self.title = title
         self.on = isOn
         self.indent = indent
         self.leadingSymbol = leadingSymbol
+        self.iconShowsState = iconShowsState
         self.apply = apply
         super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 28))
         toolTip = tip
@@ -5248,16 +5252,18 @@ final class MenuToggleRow: MenuRowView {
         }
         if let name = leadingSymbol {
             // ไอคอนนำหน้า วางเยื้องซ้ายของตัวหนังสือ 22px ให้ตรงแนวกับไอคอนแถวตั้งค่าอื่น
-            let tint = on ? NSColor.systemYellow : NSColor.secondaryLabelColor
-            let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+            let lit = on && iconShowsState
+            let tint = lit ? NSColor.systemYellow : NSColor.secondaryLabelColor
+            let config = NSImage.SymbolConfiguration(pointSize: iconShowsState ? 12 : 11, weight: iconShowsState ? .semibold : .medium)
                 .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-            if let icon = NSImage(systemSymbolName: on ? name + ".fill" : name, accessibilityDescription: nil)?
+            if let icon = NSImage(systemSymbolName: lit ? name + ".fill" : name, accessibilityDescription: nil)?
                 .withSymbolConfiguration(config)
                 ?? NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config) {
                 icon.isTemplate = false
                 let sz = icon.size
-                icon.draw(in: NSRect(x: 14 + indent - 22, y: bounds.midY - sz.height / 2,
-                                     width: sz.width, height: sz.height))
+                // ไอคอนชนิดอุปกรณ์กว้างไม่เท่ากัน (โน้ตบุ๊กกว้างกว่าเมาส์) — จัดกึ่งกลางในช่องกว้าง 18 ให้ตัวหนังสือไม่ชน
+                let x = iconShowsState ? 14 + indent - 22 : 14 + indent - 24 + (18 - sz.width) / 2
+                icon.draw(in: NSRect(x: x, y: bounds.midY - sz.height / 2, width: sz.width, height: sz.height))
             }
         }
         (title as NSString).draw(
@@ -8555,7 +8561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if chosen[device.id] != nil, chosen[device.id] != device.name { chosen[device.id] = device.name; Config.batteryDevices = chosen }
             menu.addItem(MenuToggleRow(title: device.name, isOn: chosen[device.id] != nil,
                                        tip: "Show \(device.name)'s battery (\(device.percent)% now) on the menu bar. Orange at 20%, red at 10%",
-                                       indent: 22, leadingSymbol: device.symbol) { on in
+                                       indent: 24, leadingSymbol: device.symbol, iconShowsState: false) { on in
                 var next = Config.batteryDevices
                 next[device.id] = on ? device.name : nil
                 Config.batteryDevices = next
@@ -8565,7 +8571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (id, name) in chosen.sorted(by: { $0.value < $1.value }) where !detected.contains(where: { $0.id == id }) {
             menu.addItem(MenuToggleRow(title: name + "  (not connected)", isOn: true,
                                        tip: "Its battery cell comes back when the device reconnects. Turn off to forget it",
-                                       indent: 22) { on in
+                                       indent: 24) { on in
                 guard !on else { return }
                 var next = Config.batteryDevices
                 next[id] = nil
