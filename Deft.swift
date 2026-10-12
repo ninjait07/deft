@@ -76,6 +76,7 @@ enum Config {
     @StoredBool(key: "snapLayouts", fallback: true)        static var snapLayouts: Bool
     @StoredBool(key: "snapAssist", fallback: true)         static var snapAssist: Bool
     @StoredBool(key: "dividers", fallback: true)           static var dividers: Bool
+    @StoredBool(key: "windowMemory", fallback: true)       static var windowMemory: Bool
     @StoredBool(key: "altTab", fallback: true)             static var altTab: Bool
     @StoredBool(key: "windowPreviews", fallback: true)     static var windowPreviews: Bool
     @StoredBool(key: "snapEnabled", fallback: true)        static var snapEnabled: Bool
@@ -3669,6 +3670,174 @@ enum DisplayControl {
     }
 }
 
+// MARK: - จำตำแหน่งหน้าต่างตามชุดจอ ---------------------------------------------
+
+@_silgen_name("_AXUIElementGetWindow")
+fileprivate func _AXUIElementGetWindow(_ element: AXUIElement, _ id: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+/// จอนอกหลายรุ่น (โดยเฉพาะ DisplayPort) ตัดสัญญาณออกจากเครื่องตอนจอดับ — macOS เห็นเหมือนถอดสาย ย้ายหน้าต่างทั้งหมด
+/// ไปจอที่เหลือ (หรือ "จอหลอก" ถ้าไม่เหลือเลย) พอจอกลับมาก็มักกองอยู่จอหลักจอเดียว ต้องลากกลับเองทุกครั้ง
+/// ตัวนี้จำว่าแต่ละหน้าต่างอยู่ตรงไหนระหว่างที่ "ชุดจอ" นิ่ง แล้วพอชุดจอเดิมกลับมา ก็ย้ายกลับที่เดิมให้
+///
+/// - ชุดจอ = UUID + ตำแหน่ง/ขนาดของทุกจอ (id ของจอเปลี่ยนทุกครั้งที่ต่อใหม่ แต่ UUID คงเดิม) — จัดเรียงจอใหม่ถือเป็นชุดใหม่
+/// - หน้าต่างอ้างด้วยเลขหน้าต่างของระบบ ซึ่งคงเดิมตราบที่แอปยังเปิดอยู่
+/// - จำเฉพาะตอนชุดจอนิ่งมาแล้ว 8 วิ และทิ้งภาพที่ถ่ายก่อนจอเปลี่ยนไม่ถึง 2 วิ (อาจเป็นจังหวะที่ระบบเริ่มย้ายแล้ว)
+/// - ย้ายกลับครั้งเดียวต่อการกลับมาของชุดจอ (หลังระบบจัดจอนิ่ง 3 วิ + เก็บตกอีกรอบ) ไม่สู้กับผู้ใช้ทีหลัง
+/// - ข้ามหน้าต่างที่ย่ออยู่/เต็มจอ · งาน Accessibility ทำนอก main thread
+final class WindowMemory {
+    static let shared = WindowMemory()
+
+    private struct Shot {
+        let at: Date
+        let frames: [CGWindowID: CGRect]     // พิกัด CG
+    }
+
+    private let queue = DispatchQueue(label: "com.nonbannawat.deft.window-memory", qos: .utility)
+    private var timer: Timer?
+    private var settle: DispatchWorkItem?
+    // บน queue
+    private var shots: [String: [Shot]] = [:]         // ชุดจอ → ภาพล่าสุด 2 ใบ (ใหม่สุดอยู่ท้าย)
+    private var stable: String?                       // ชุดจอที่ยืนยันแล้วว่านิ่ง (จำ/ย้ายกลับเสร็จแล้ว)
+    private var wandered = false                      // ระหว่างรอให้นิ่ง เคยเห็นชุดจออื่นแวบหนึ่ง (จอหลุดแล้วกลับมาเร็ว)
+    private var changedAt = Date.distantPast
+
+    func refresh() {
+        timer?.invalidate()
+        timer = nil
+        guard Config.windowMemory else {
+            queue.async { self.shots = [:]; self.stable = nil }
+            return
+        }
+        let t = Timer(timeInterval: 10, repeats: true) { [weak self] _ in self?.remember() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        queue.async { if self.stable == nil { self.stable = Self.signature() } }
+        remember()
+    }
+
+    /// ชุดจอเปลี่ยน (เรียกบน main ทุกครั้งที่ระบบแจ้ง) — รอให้นิ่ง 3 วิ แล้วค่อยดูว่าต้องย้ายอะไรกลับ
+    func displaysChanged() {
+        guard Config.windowMemory else { return }
+        let now = Date()
+        queue.async {
+            // ภาพที่ถ่ายก่อนหน้านี้ไม่ถึง 2 วิ อาจถ่ายตอนระบบเริ่มย้ายหน้าต่างไปแล้ว — ทิ้ง ใช้ใบก่อนหน้าแทน
+            if let old = self.stable, var list = self.shots[old], let last = list.last, now.timeIntervalSince(last.at) < 2 {
+                list.removeLast()
+                self.shots[old] = list
+            }
+            self.changedAt = now
+            if Self.signature() != self.stable { self.wandered = true }
+        }
+        settle?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.arrive() }
+        settle = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: work)
+    }
+
+    // MARK: จำ
+
+    private func remember() {
+        let pids = Self.regularPIDs()
+        queue.async {
+            let now = Date()
+            let signature = Self.signature()
+            // จำเฉพาะชุดจอที่นิ่งและผ่านการย้ายกลับมาแล้ว — ไม่งั้นจะจำสภาพ "กองอยู่จอเดียว" ทับของดี
+            guard signature == self.stable, now.timeIntervalSince(self.changedAt) > 8 else { return }
+            let frames = Self.windows(of: pids).mapValues(\.frame)
+            guard !frames.isEmpty else { return }
+            var list = self.shots[signature] ?? []
+            list.append(Shot(at: now, frames: frames))
+            self.shots[signature] = Array(list.suffix(2))
+            if self.shots.count > 12 {      // ชุดจอเก่า ๆ ที่ไม่ได้ใช้นานแล้ว
+                let oldest = self.shots.min { ($0.value.last?.at ?? .distantPast) < ($1.value.last?.at ?? .distantPast) }
+                if let oldest { self.shots[oldest.key] = nil }
+            }
+        }
+    }
+
+    // MARK: ย้ายกลับ
+
+    private func arrive() {
+        let pids = Self.regularPIDs()
+        queue.async {
+            let signature = Self.signature()
+            // ชุดเดิมและไม่เคยเห็นชุดอื่นเลย = แค่ Dock/เมนูบาร์เปลี่ยน ไม่มีอะไรถูกย้าย
+            guard signature != self.stable || self.wandered else { return }
+            self.wandered = false
+            self.stable = signature
+            guard let shot = self.shots[signature]?.last else {
+                knackLog("layout: new display set, nothing remembered yet")
+                return
+            }
+            let moved = Self.restore(shot.frames, pids: pids)
+            knackLog("layout: display set returned — moved \(moved) of \(shot.frames.count) remembered windows back (remembered \(Int(Date().timeIntervalSince(shot.at))) s ago)")
+            // เก็บตก: บางแอปหรือ macOS เองขยับหน้าต่างช้ากว่านี้
+            self.queue.asyncAfter(deadline: .now() + 2.5) {
+                guard Self.signature() == signature, self.stable == signature else { return }
+                let again = Self.restore(shot.frames, pids: pids)
+                if again > 0 { knackLog("layout: second pass moved \(again) more") }
+            }
+        }
+    }
+
+    private static func restore(_ frames: [CGWindowID: CGRect], pids: [pid_t]) -> Int {
+        var moved = 0
+        for (id, window) in windows(of: pids) {
+            guard let wanted = frames[id] else { continue }
+            let now = window.frame
+            guard abs(now.minX - wanted.minX) > 12 || abs(now.minY - wanted.minY) > 12
+                    || abs(now.width - wanted.width) > 12 || abs(now.height - wanted.height) > 12 else { continue }
+            AX.setFrame(window.element, wanted)
+            // หน้าต่างที่ใหญ่กว่าจอที่มันค้างอยู่: macOS ไม่ยอมเปลี่ยนความกว้างจนกว่าจะย้ายออกมาก่อน — สั่งซ้ำอีกรอบจากที่ใหม่
+            if let after = AX.frame(of: window.element),
+               abs(after.width - wanted.width) > 12 || abs(after.height - wanted.height) > 12 {
+                AX.setFrame(window.element, wanted)
+            }
+            moved += 1
+        }
+        return moved
+    }
+
+    // MARK: ข้อมูลดิบ
+
+    private static func regularPIDs() -> [pid_t] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != getpid() }
+            .map(\.processIdentifier)
+    }
+
+    /// หน้าต่างปกติของแอปทั่วไป (ไม่ย่อ ไม่เต็มจอ) → เลขหน้าต่างของระบบ
+    private static func windows(of pids: [pid_t]) -> [CGWindowID: (element: AXUIElement, frame: CGRect)] {
+        var result: [CGWindowID: (element: AXUIElement, frame: CGRect)] = [:]
+        for pid in pids {
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 0.25)
+            guard let windows = AX.attribute(app, kAXWindowsAttribute) as? [AXUIElement] else { continue }
+            for window in windows {
+                guard AX.string(window, kAXSubroleAttribute) == (kAXStandardWindowSubrole as String),
+                      !AX.bool(window, kAXMinimizedAttribute), !AX.isFullScreen(window),
+                      let frame = AX.frame(of: window), frame.width > 60, frame.height > 60 else { continue }
+                var id: CGWindowID = 0
+                guard _AXUIElementGetWindow(window, &id) == .success, id != 0 else { continue }
+                result[id] = (window, frame)
+            }
+        }
+        return result
+    }
+
+    /// ลายเซ็นของชุดจอ: UUID + กรอบของทุกจอที่ออนไลน์ เรียงให้คงที่
+    private static func signature() -> String {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(16, &ids, &count) == .success else { return "" }
+        return ids.prefix(Int(count)).map { id -> String in
+            let uuid = CGDisplayCreateUUIDFromDisplayID(id).map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String } ?? "id\(id)"
+            let b = CGDisplayBounds(id)
+            return "\(uuid)@\(Int(b.minX)),\(Int(b.minY)),\(Int(b.width))x\(Int(b.height))"
+        }.sorted().joined(separator: "|")
+    }
+}
+
 // MARK: - หมุนจอ (MonitorPanel.framework — ตัวเดียวกับที่ System Settings ใช้) --
 
 /// CoreGraphics ไม่มีคำสั่งหมุนจอที่เปิดให้ใช้ และ Apple Silicon ไม่มี IOFramebuffer
@@ -3804,6 +3973,7 @@ enum MasterSwitch {
     case windowsShortcuts, autoKeyboard, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
     case monitorCPU, monitorRAM, monitorSSD, monitorTemp, aiUsage
+    case windowMemory
     case launchAtLogin
 
     var isOn: Bool {
@@ -3821,6 +3991,7 @@ enum MasterSwitch {
         case .monitorSSD:       return Config.monitorSSD
         case .monitorTemp:      return Config.monitorTemp
         case .aiUsage:          return Config.aiUsage
+        case .windowMemory:     return Config.windowMemory
         case .launchAtLogin:    return LoginItem.isEnabled
         }
     }
@@ -3877,6 +4048,9 @@ enum MasterSwitch {
             Config.aiUsage = value
             AIUsage.shared.refresh()
             SystemMonitor.shared.refresh()
+        case .windowMemory:
+            Config.windowMemory = value
+            WindowMemory.shared.refresh()
         case .launchAtLogin:
             Config.launchAtLogin = value
             LoginItem.set(value)
@@ -7073,6 +7247,9 @@ final class ManualWindow: NSWindow {
             ("Per-display controls",
              "For each display you can change resolution, refresh rate, rotation, set it as the main display, or power it off (Deft remembers powered-off displays across restarts).",
              "แต่ละจอปรับความละเอียด อัตรารีเฟรช การหมุน ตั้งเป็นจอหลัก หรือสั่งปิดจอได้ (Deft จำจอที่ปิดไว้ข้ามการรีสตาร์ต)"),
+            ("Remember Window Layout",
+             "Some monitors drop off the Mac when they go to sleep, and macOS then piles every window onto one display. With this on, Deft remembers where each window was while your set of displays is steady, and when the same displays come back it puts the windows back on their display at the same size. It acts once, a few seconds after the displays return, and skips minimized and full-screen windows.",
+             "จอบางรุ่นตัดสัญญาณออกจากเครื่องตอนจอดับ แล้ว macOS จะเทหน้าต่างทั้งหมดไปกองที่จอเดียว เมื่อเปิดตัวเลือกนี้ Deft จะจำว่าแต่ละหน้าต่างอยู่ตรงไหนระหว่างที่ชุดจอของคุณนิ่ง พอจอชุดเดิมกลับมาก็ย้ายหน้าต่างกลับไปจอเดิมและขนาดเดิมให้ ทำครั้งเดียวหลังจอกลับมาไม่กี่วินาที และข้ามหน้าต่างที่ย่ออยู่หรือเต็มจอ"),
             ("Arrange Displays",
              "Open the Arrange Displays window to drag displays into position with edge snapping, rotate a selected display, and set the main one.",
              "เปิดหน้าต่าง Arrange Displays เพื่อลากจัดตำแหน่งจอแบบขอบดูดเข้าหากัน หมุนจอที่เลือก และตั้งจอหลัก"),
@@ -8120,6 +8297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { _ in
             Geometry.refresh()
             DockItems.invalidate()
+            WindowMemory.shared.displaysChanged()
             SnapManager.shared.rebuildDividers()
             // เสียบจอ/รีสตาร์ทแล้วจอที่เคยสั่งปิดกลับมา → รอให้ระบบจัดจอเสร็จแล้วปิดให้ซ้ำ
             knackLog("screen parameters changed")
@@ -8160,6 +8338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 
         buildStatusItem()
+        WindowMemory.shared.refresh()
         SystemMonitor.shared.refresh()   // สร้างหลังไอคอน Deft เพื่อให้ไปอยู่ทางซ้ายของไอคอน
         AIUsage.shared.refresh()
         startWhenTrusted()
@@ -8715,6 +8894,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ArrangeDisplaysWindow.shared.present()
             }))
         }
+        menu.addItem(toggle("Remember Window Layout", .windowMemory,
+                            tip: "When your displays go away and come back (sleep, unplugging), put every window back on the display and at the size it had before"))
     }
 
     /// ตัวเลือกของจอที่กางดูอยู่ (ความละเอียด/Hz/หมุน/ตำแหน่ง) — กางได้ทีละอย่าง
