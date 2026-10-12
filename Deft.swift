@@ -122,9 +122,10 @@ enum Config {
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
     @StoredBool(key: "monitorTemp", fallback: true)          static var monitorTemp: Bool
+    @StoredBool(key: "monitorBattery", fallback: false)      static var monitorBattery: Bool
     /// ความขุ่นของกระจกใต้ตัวหนังสือ (เมนู, Donate, Arrange Displays) — 0 = ใสสุด · 1 = เกือบทึบ
     @StoredNumber(key: "glassOpacity", fallback: 0.5)        static var glassOpacity: CGFloat
-    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp }
+    static var monitorAny: Bool { monitorCPU || monitorRAM || monitorSSD || monitorTemp || monitorBattery }
     /// แก้วน้ำโควต้า Claude Code บนเมนูบาร์
     @StoredBool(key: "aiUsage", fallback: true)              static var aiUsage: Bool
     /// ค่างาน ($ เทียบราคา API) ที่ถือเป็น 100% ของหน้าต่าง 5 ชม. — ได้จากการเทียบกับ /usage (0 = อัตโนมัติ)
@@ -3798,7 +3799,7 @@ enum MasterSwitch {
     case windowsSnap, livePreview
     case windowsShortcuts, autoKeyboard, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
-    case monitorCPU, monitorRAM, monitorSSD, monitorTemp, aiUsage
+    case monitorCPU, monitorRAM, monitorSSD, monitorTemp, monitorBattery, aiUsage
     case launchAtLogin
 
     var isOn: Bool {
@@ -3815,6 +3816,7 @@ enum MasterSwitch {
         case .monitorRAM:       return Config.monitorRAM
         case .monitorSSD:       return Config.monitorSSD
         case .monitorTemp:      return Config.monitorTemp
+        case .monitorBattery:   return Config.monitorBattery
         case .aiUsage:          return Config.aiUsage
         case .launchAtLogin:    return LoginItem.isEnabled
         }
@@ -3867,6 +3869,9 @@ enum MasterSwitch {
             SystemMonitor.shared.refresh()
         case .monitorTemp:
             Config.monitorTemp = value
+            SystemMonitor.shared.refresh()
+        case .monitorBattery:
+            Config.monitorBattery = value
             SystemMonitor.shared.refresh()
         case .aiUsage:
             Config.aiUsage = value
@@ -5691,6 +5696,97 @@ final class AIUsage {
 
     private func push() { SystemMonitor.shared.redraw() }
 
+    // MARK: ให้ Claude Code เช็กโควต้าเอง
+
+    // ตัวเลขทางการใน ~/.claude.json เปลี่ยนเฉพาะตอน Claude Code รัน /usage — ส่วนขยายใน VS Code โชว์ % ของมันเอง
+    // แต่ไม่เขียนไฟล์นี้ ตัวเลขใน Deft จึงค้างเป็นวัน ๆ จนกว่าจะมีคนพิมพ์ /usage ใน CLI
+    // Deft จึงสั่ง CLI ของ Claude Code ที่ติดตั้งอยู่ให้รัน /usage แบบเบื้องหลัง: Claude Code เป็นคนถาม Anthropic
+    // ด้วยการล็อกอินของมันเอง แล้วเขียนผลลงไฟล์เดิม · Deft ไม่แตะ token และไม่เรียก API เอง
+    // /usage เป็นคำสั่งในเครื่อง ไม่ส่งข้อความหาโมเดล จึงไม่กินโควต้า (รันจริงราว 4 วิ)
+    private var latestEntry = Date.distantPast       // เวลาของข้อความล่าสุดใน log (บน queue)
+    private var askedAt = Date.distantPast
+    private var asking = false
+    private var askFailures = 0                      // ถามแล้วตัวเลขไม่ขยับกี่ครั้งติด (ยังไม่ล็อกอิน CLI / เน็ตล่ม) → ถามห่างขึ้น
+    private var wantFresh = false                    // มีคนเปิดแผงดู — อยากได้ตัวเลขสดแม้ไม่มีงานใหม่
+    private var cli: String?
+    private var cliSearchedAt = Date.distantPast
+
+    /// เปิดแผงรายละเอียด = ขอตัวเลขสด (ถ้าของเดิมเก่ากว่า 2 นาที)
+    func wantFreshNumbers() {
+        queue.async { self.wantFresh = true; self.askClaudeCodeIfStale(official: Self.readOfficial()) }
+    }
+
+    /// บน queue · ถามเมื่อ: ตัวเลขเก่ากว่า 5 นาทีและมีงานใน 10 นาทีล่าสุด (ตัวเลขกำลังขยับ) หรือมีคนเปิดแผงดู
+    /// ไม่ถามถี่กว่า 4 นาทีต่อครั้ง และไม่ถามตอนไม่มีงาน เพราะตัวเลขไม่เปลี่ยน (เวลารีเซ็ตรู้อยู่แล้ว)
+    private func askClaudeCodeIfStale(official: Official?) {
+        guard !asking else { return }
+        let now = Date()
+        let age = official.map { now.timeIntervalSince($0.fetchedAt) } ?? .infinity
+        let active = now.timeIntervalSince(latestEntry) < 10 * 60
+        let wanted = wantFresh && age > 2 * 60
+        // ถามแล้วไม่ได้ผล: เว้น 4 → 8 → 16 … นาที สูงสุด 1 ชม. จะได้ไม่เปิดโปรเซสทิ้งเปล่า ๆ ทุก 4 นาที
+        let gap = min(3600, 4 * 60 * pow(2, Double(askFailures)))
+        guard wanted || (active && age > 5 * 60), now.timeIntervalSince(askedAt) > (wanted && askFailures == 0 ? 60 : gap) else {
+            if age <= 2 * 60 { wantFresh = false }
+            return
+        }
+        guard let path = claudeCLI() else { wantFresh = false; return }
+        asking = true
+        askedAt = now
+        wantFresh = false
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        // ไม่เก็บ session ลงดิสก์ ไม่เปิด MCP server และไม่รัน hook ของผู้ใช้ — แค่ถามโควต้า
+        process.arguments = ["-p", "/usage", "--max-turns", "1", "--no-session-persistence",
+                             "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}",
+                             "--settings", "{\"disableAllHooks\":true}"]
+        // claude เป็นสคริปต์ node — ต้องหา node เจอจากโฟลเดอร์เดียวกัน (nvm/homebrew) · แอป GUI ไม่ได้ PATH ของ shell
+        var environment = ProcessInfo.processInfo.environment
+        let bin = (path as NSString).deletingLastPathComponent
+        environment["PATH"] = [bin, "/opt/homebrew/bin", "/usr/local/bin", environment["PATH"] ?? "/usr/bin:/bin"].joined(separator: ":")
+        process.environment = environment
+        // โฟลเดอร์ทำงานของตัวเอง — Claude Code ผูกบันทึกกับโฟลเดอร์ที่รัน จะได้ไม่ไปปนกับโปรเจกต์ของผู้ใช้
+        let home = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("com.nonbannawat.deft/claude-usage")
+        try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        process.currentDirectoryURL = home
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let fetchedBefore = official?.fetchedAt
+        process.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                self.asking = false
+                let refreshed = Self.readOfficial()?.fetchedAt != fetchedBefore
+                self.askFailures = refreshed ? 0 : min(self.askFailures + 1, 6)
+            }
+            self.scan(force: true)      // อ่านตัวเลขใหม่จากไฟล์แล้ววาดช่อง
+        }
+        do { try process.run() } catch { asking = false; return }
+        // ค้างเกิน 40 วิ (เน็ตล่ม / รอล็อกอิน) ก็เลิก
+        DispatchQueue.global().asyncAfter(deadline: .now() + 40) { if process.isRunning { process.terminate() } }
+    }
+
+    /// หา CLI ของ Claude Code ตามที่ติดตั้งกันทั่วไป (ตัวติดตั้งของ Anthropic, Homebrew, npm ผ่าน nvm ฯลฯ)
+    /// ไม่เจอ = ไม่มี CLI (ใช้แต่ส่วนขยาย) → ใช้ตัวเลขเดิมกับค่าประมาณต่อไป · หาใหม่ทุกครึ่งชั่วโมงเผื่อติดตั้งทีหลัง
+    private func claudeCLI() -> String? {
+        if let cli, FileManager.default.isExecutableFile(atPath: cli) { return cli }
+        guard Date().timeIntervalSince(cliSearchedAt) > 30 * 60 else { return nil }
+        cliSearchedAt = Date()
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var candidates = ["\(home)/.claude/local/claude", "\(home)/.local/bin/claude", "/opt/homebrew/bin/claude",
+                          "/usr/local/bin/claude", "\(home)/.npm-global/bin/claude", "\(home)/.bun/bin/claude",
+                          "\(home)/.volta/bin/claude", "\(home)/.yarn/bin/claude"]
+        let nvm = "\(home)/.nvm/versions/node"
+        let versions = ((try? FileManager.default.contentsOfDirectory(atPath: nvm)) ?? [])
+            .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+        candidates += versions.map { "\(nvm)/\($0)/bin/claude" }
+        cli = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        return cli
+    }
+
     // MARK: อ่าน log แบบต่อท้าย (ไฟล์ jsonl มีแต่เพิ่ม ไม่แก้ของเก่า)
 
     private func scan(force: Bool = false) {
@@ -5723,6 +5819,7 @@ final class AIUsage {
                 for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                     guard let (id, entry) = parse(line) else { continue }
                     changed = true
+                    if entry.time > latestEntry { latestEntry = entry.time }
                     guard let id else { anonymous.append(entry); continue }
                     if var known = byID[id] {
                         known.input = max(known.input, entry.input)
@@ -5737,6 +5834,7 @@ final class AIUsage {
                 }
             }
             let official = Self.readOfficial()
+            askClaudeCodeIfStale(official: official)
             if official?.fetchedAt != snapshot.official?.fetchedAt { changed = true }
             guard changed || !snapshot.scanned else { return }
             let cutoff = Date().addingTimeInterval(-40 * 86400)
@@ -5957,6 +6055,11 @@ final class MonitorCellsView: NSView {
         var percent: Int
         var prefix = ""             // "≈" ตอนเป็นค่าประมาณ
         var celsius = false         // แสดงเป็นองศา (percent = Thermal.percent ของอุณหภูมิ)
+        var lowIsBad = false        // แบตเตอรี่: ยิ่งน้อยยิ่งแย่ — ส้ม ≤20% แดง ≤10% (ช่องอื่นเตือนตอนค่าสูง)
+
+        /// ถึงระดับเตือนสีแดง (แถบหายใจ ตัวเลขแดง)
+        func critical(_ level: Int) -> Bool { lowIsBad ? level <= 10 : level >= 85 }
+        func warning(_ level: Int) -> Bool { lowIsBad ? level <= 20 : level >= 70 }
     }
     static let claudeBrand = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)   // ส้มของ Claude
 
@@ -5991,7 +6094,7 @@ final class MonitorCellsView: NSView {
     }
 
     private var needsMotion: Bool {
-        for (i, c) in cells.enumerated() where abs(shown[i] - Double(c.percent)) > 0.15 || c.percent >= 85 { return true }
+        for (i, c) in cells.enumerated() where abs(shown[i] - Double(c.percent)) > 0.15 || c.critical(c.percent) { return true }
         return false
     }
 
@@ -6056,9 +6159,11 @@ final class MonitorCellsView: NSView {
             let smooth = max(0, min(100, index < shown.count ? shown[index] : Double(cell.percent)))
             let level = Int(smooth.rounded())
             let isClaude = cell.symbol == "claude"
-            let tint: NSColor = level >= 85 ? .systemRed : level >= 70 ? .systemOrange : (isClaude ? Self.claudeBrand : Skin.accent)
+            let critical = cell.critical(level)
+            let tint: NSColor = critical ? .systemRed : cell.warning(level) ? .systemOrange
+                : (isClaude ? Self.claudeBrand : cell.lowIsBad ? .systemGreen : Skin.accent)
             // วิกฤต = แถบหายใจ (ความทึบแกว่ง 0.22–0.42 ช้า ๆ)
-            let breath = level >= 85 ? 0.32 + 0.10 * sin(phase) : 0.28
+            let breath = critical ? 0.32 + 0.10 * sin(phase) : 0.28
             NSGraphicsContext.saveGraphicsState()
             shape.addClip()
             tint.withAlphaComponent(breath).setFill()
@@ -6076,7 +6181,7 @@ final class MonitorCellsView: NSView {
             }
             let shown = cell.celsius ? "\(Int(Thermal.celsius(fromPercent: smooth).rounded()))°" : "\(level)%"
             let value = NSAttributedString(string: cell.prefix + shown, attributes: [
-                .font: Self.valueFont, .foregroundColor: level >= 85 ? NSColor.systemRed : NSColor.labelColor])
+                .font: Self.valueFont, .foregroundColor: critical ? NSColor.systemRed : NSColor.labelColor])
             let valueSize = value.size()
             value.draw(at: NSPoint(x: rect.maxX - 5 - valueSize.width, y: rect.midY - valueSize.height / 2))
         }
@@ -6389,8 +6494,10 @@ final class SystemMonitor: NSObject {
         var readRate: Double = 0, writeRate: Double = 0   // bytes/s
         var diskUsed: Int64 = 0, diskTotal: Int64 = 0     // ความจุ ใช้แค่ในเมนูรายละเอียด
         var temp: Thermal.Reading?
+        var batteries: [DeviceBatteries.Device] = []
     }
     private(set) var sample = Sample()
+    private var batteriesReadAt: CFAbsoluteTime = 0
 
     private var item: NSStatusItem?
     private let cellsView = MonitorCellsView(frame: .zero)
@@ -6417,10 +6524,9 @@ final class SystemMonitor: NSObject {
     func redraw() { if item != nil { cellsView.cells = cells() } }
 
     /// ความกว้างคงที่ตามจำนวนช่องที่เปิด ไม่ขึ้นกับตัวเลขข้างใน
-    private func layout() {
+    private func layout(count known: Int? = nil) {
         guard let item, let button = item.button else { return }
-        let count = [Config.monitorCPU, Config.monitorRAM, Config.monitorSSD, Config.monitorTemp && Thermal.available,
-                     AIUsage.shared.showing].filter { $0 }.count
+        let count = known ?? cells().count
         item.length = MonitorCellsView.width(for: count)
         cellsView.frame = button.bounds
         cellsView.autoresizingMask = [.width, .height]
@@ -6507,8 +6613,20 @@ final class SystemMonitor: NSObject {
 
         next.temp = Thermal.read()
 
+        // แบตเตอรี่เปลี่ยนช้า อ่านทุก 30 วิพอ (อุปกรณ์เพิ่งต่อ/ถอดจะเห็นภายในครึ่งนาที)
+        let now = CFAbsoluteTimeGetCurrent()
+        if Config.monitorBattery, now - batteriesReadAt >= 30 {
+            batteriesReadAt = now
+            next.batteries = DeviceBatteries.read()
+        } else {
+            next.batteries = Config.monitorBattery ? sample.batteries : []
+            if !Config.monitorBattery { batteriesReadAt = 0 }
+        }
+
         sample = next
-        cellsView.cells = cells()
+        let updated = cells()
+        if updated.count != cellsView.cells.count { layout(count: updated.count) }   // ช่องแบตโผล่/หายตามอุปกรณ์ที่ต่ออยู่
+        cellsView.cells = updated
         tilesRow?.tiles = tiles()
     }
 
@@ -6674,6 +6792,14 @@ final class SystemMonitor: NSObject {
             if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { level = max(level, 85) }
             result.append(.init(symbol: "thermometer.medium", percent: level, celsius: true))
         }
+        // แบตเตอรี่: ตัวที่ "เหลือน้อยที่สุด" ในบรรดาอุปกรณ์ที่ต่ออยู่ (ตัวที่ต้องรีบชาร์จก่อน) พร้อมไอคอนของอุปกรณ์นั้น
+        // ไม่มีอุปกรณ์เสริมเลยจึงใช้แบตของ Mac เอง · ไม่มีอะไรรายงานแบตก็ไม่มีช่องนี้
+        if Config.monitorBattery {
+            let accessories = sample.batteries.filter { $0.symbol != "laptopcomputer" }
+            if let lowest = (accessories.isEmpty ? sample.batteries : accessories).min(by: { $0.percent < $1.percent }) {
+                result.append(.init(symbol: lowest.symbol, percent: lowest.percent, lowIsBad: true))
+            }
+        }
         if AIUsage.shared.showing {
             result.append(.init(symbol: "claude", percent: Int((AIUsage.shared.display * 100).rounded()),
                                 prefix: AIUsage.shared.isLive ? "" : "≈"))
@@ -6708,6 +6834,7 @@ final class SystemMonitor: NSObject {
         if AIUsage.shared.showing {
             rows.append(MenuSeparatorRow())
             rows.append(contentsOf: AIUsage.shared.detailRows())
+            AIUsage.shared.wantFreshNumbers()   // ตัวเลขเก่าเกิน 2 นาที → ให้ Claude Code เช็กใหม่ (ช่องบนเมนูบาร์จะขยับตาม)
         }
         rows.append(MenuSeparatorRow())
         rows.append(MenuActionRow(title: "Open Activity Monitor", symbolName: "chart.bar.xaxis") { [weak self] in
@@ -6729,6 +6856,7 @@ final class SystemMonitor: NSObject {
         MasterSwitch.monitorRAM.set(false)
         MasterSwitch.monitorSSD.set(false)
         MasterSwitch.monitorTemp.set(false)
+        MasterSwitch.monitorBattery.set(false)
         MasterSwitch.aiUsage.set(false)
         AppDelegate.shared?.refreshMenu()
     }
@@ -6897,8 +7025,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("AI Usage", "โควต้า AI", [
             ("Claude Code Quota",
-             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. Between checks, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times. When Claude Code hasn't checked for a while the value is marked ≈; if a new week has started since, the weekly limit shows – until you run /usage in Claude Code. The cell only appears on Macs where Claude Code is installed — usage on claude.ai alone can't be shown, because Anthropic doesn't let other apps read it.",
-             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี ระหว่างรอบเช็ก Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต ถ้า Claude Code ไม่ได้เช็กมาสักพัก ตัวเลขจะมี ≈ นำหน้า และถ้าขึ้นสัปดาห์ใหม่ไปแล้ว โควต้ารายสัปดาห์จะแสดง – จนกว่าจะรัน /usage ใน Claude Code ช่องนี้จะขึ้นเฉพาะเครื่องที่ติดตั้ง Claude Code เท่านั้น ถ้าใช้แค่ claude.ai บนเว็บจะแสดงไม่ได้ เพราะ Anthropic ไม่อนุญาตให้แอปอื่นอ่านข้อมูลนี้"),
+             "Shows your Claude Code quota on the menu bar as a cell like CPU/RAM: the Claude mark and how much of the current 5-hour session you've used (orange → red as it fills). The numbers are the same ones /usage shows — Claude Code saves them on your Mac whenever it checks, and Deft reads that file; nothing is sent anywhere and no account is linked. So the numbers stay current, Deft asks the Claude Code command-line tool to run /usage in the background about every five minutes while you're using Claude Code, and when you open the details (it uses none of your quota, and Deft never sees your sign-in). In between, or if the command-line tool isn't installed, Deft adds the work it sees in Claude Code's local logs. Click the cell for the session, weekly and per-model weekly limits with reset times. When Claude Code hasn't checked for a while the value is marked ≈; if a new week has started since, the weekly limit shows – until you run /usage in Claude Code. The cell only appears on Macs where Claude Code is installed — usage on claude.ai alone can't be shown, because Anthropic doesn't let other apps read it.",
+             "แสดงโควต้า Claude Code บนเมนูบาร์เป็นช่องแบบเดียวกับ CPU/RAM: โลโก้ Claude กับสัดส่วนที่ใช้ไปของ session 5 ชั่วโมงปัจจุบัน (ส้ม → แดงเมื่อใกล้เต็ม) ตัวเลขชุดเดียวกับที่ /usage แสดง เพราะ Claude Code เก็บไว้ในเครื่องทุกครั้งที่เช็ก และ Deft อ่านจากไฟล์นั้น ไม่มีอะไรถูกส่งออกไปและไม่ต้องผูกบัญชี เพื่อให้ตัวเลขสดอยู่เสมอ Deft จะสั่งโปรแกรม Claude Code (ตัว command line) ให้รัน /usage แบบเบื้องหลังราวทุก 5 นาทีระหว่างที่คุณใช้ Claude Code และตอนเปิดดูรายละเอียด (ไม่กินโควต้า และ Deft ไม่เห็นการล็อกอินของคุณ) ระหว่างนั้นหรือถ้าไม่ได้ติดตั้งตัว command line ไว้ Deft จะบวกงานที่เห็นใน log ของ Claude Code เพิ่มให้ คลิกที่ช่องเพื่อดูโควต้า session, รายสัปดาห์ และรายสัปดาห์ต่อโมเดล พร้อมเวลารีเซ็ต ถ้า Claude Code ไม่ได้เช็กมาสักพัก ตัวเลขจะมี ≈ นำหน้า และถ้าขึ้นสัปดาห์ใหม่ไปแล้ว โควต้ารายสัปดาห์จะแสดง – จนกว่าจะรัน /usage ใน Claude Code ช่องนี้จะขึ้นเฉพาะเครื่องที่ติดตั้ง Claude Code เท่านั้น ถ้าใช้แค่ claude.ai บนเว็บจะแสดงไม่ได้ เพราะ Anthropic ไม่อนุญาตให้แอปอื่นอ่านข้อมูลนี้"),
         ]),
         ("Mouse", "เมาส์", [
             ("Mouse Natural Scroll",
@@ -6913,8 +7041,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
             ("CPU · RAM · SSD · Temperature",
-             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging).",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ)"),
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging). Turn on Battery to keep the lowest of those devices on the menu bar too.",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ) เปิดสวิตช์ Battery เพื่อให้อุปกรณ์ที่แบตเหลือน้อยที่สุดขึ้นบนแถบเมนูด้วย"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
@@ -8396,6 +8524,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(toggle("Temperature", .monitorTemp,
                                 tip: "Hottest CPU core in °C, read from the chip's own sensors. Turns orange above ~81°C and red above ~93°C. Click for SSD and battery temperatures"))
         }
+        menu.addItem(toggle("Battery", .monitorBattery,
+                            tip: "Battery of the connected device that is lowest (mouse, keyboard, headphones), or this Mac if there is none. Orange at 20%, red at 10%. Click for every device"))
 
         // ---- AI Usage ------------------------------------------------------
         menu.addItem(separator())

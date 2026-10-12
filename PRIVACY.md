@@ -14,6 +14,8 @@ Everything Deft does happens locally on your Mac. To provide its features, Deft 
 
 **Network use:** Deft connects to the internet for exactly one thing — checking for a new version by reading a small public file (appcast.json) on GitHub. That request contains no personal data. Deft has no accounts, no analytics, no ads, and no tracking.
 
+**Claude Code usage (optional):** when the AI Usage cell is on and the Claude Code command-line tool is installed, Deft asks that tool to run its own `/usage` command in the background — about every five minutes while you are using Claude Code, and when you open the monitor details. Claude Code then contacts Anthropic with its own sign-in, exactly as when you type `/usage` yourself, and saves the percentages on your Mac, where Deft reads them. Deft never sees your Claude sign-in, sends nothing itself, and the command uses none of your quota. Turn the AI Usage switch off to stop it.
+
 **Donations** are handled entirely by third parties (your bank via PromptPay, or GitHub Sponsors). Deft never sees or stores your payment details.
 
 ## ไทย
