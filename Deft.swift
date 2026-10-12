@@ -12,7 +12,7 @@
 //    • ลาก title bar ไปบนกลางจอ           → Snap Layouts
 //    • ลากขอบบน/ล่างหน้าต่างชนขอบจอ        → Vertical maximize
 //    • ดับเบิลคลิกขอบบน/ล่างหน้าต่าง        → Vertical maximize
-//    • ลากหน้าต่างที่ snap อยู่ออกมา        → คืนขนาดเดิมระหว่างลาก
+//    • ลากหน้าต่างที่ snap อยู่ออกมา        → เป็นหน้าต่างลอยขนาดราว 1/5 ของจอ
 //    • ขอบด้านในระหว่าง 2 จอ               → มีแรงต้าน
 //    • ลากเส้นแบ่งระหว่างหน้าต่างที่ snap คู่ → ปรับขนาดพร้อมกัน
 //
@@ -1824,6 +1824,8 @@ final class SnapManager {
     private var startFrame: CGRect = .zero
     private var lastModeCheck: CFAbsoluteTime = 0
     private var didUnsnap = false
+    /// จอที่ใช้คิดขนาดตอนดึงหน้าต่างออกจาก snap ในการลากครั้งนี้ (nil = ไม่ได้ดึงออกจาก snap)
+    private var floatScreen: NSScreen?
 
     private var activeTarget: SnapTarget?
     private var activeScreen: NSScreen?
@@ -2160,7 +2162,13 @@ final class SnapManager {
         defer { resetDrag() }
         overlay.dismiss()
         layoutBar.dismiss()
-        guard let target = activeTarget, let screen = activeScreen, let window = draggedWindow else { return }
+        guard let target = activeTarget, let screen = activeScreen, let window = draggedWindow else {
+            // ไม่ได้ปล่อยลงโซน snap — ถ้าเพิ่งดึงออกจาก snap แล้วมาปล่อยบนอีกจอ ปรับขนาดตามจอนั้น
+            if let window = draggedWindow, let cursor = CGEvent(source: nil)?.location {
+                refitFloating(window: window, cursor: cursor)
+            }
+            return
+        }
         commit(target: target, window: window, currentFrame: startFrame, screen: screen, chain: true)
     }
 
@@ -2170,6 +2178,7 @@ final class SnapManager {
         dragMode = .undetermined
         borderHint = .ignored
         didUnsnap = false
+        floatScreen = nil
         activeTarget = nil
         activeScreen = nil
         pendingTarget = nil
@@ -2230,24 +2239,15 @@ final class SnapManager {
         let key = AXKey(element: window)
         didUnsnap = true   // ตัดสินครั้งเดียวต่อการลาก — ไม่ว่าจะย่อหรือไม่
 
-        // ขนาดที่จะคืนให้: ปกติคือขนาดก่อน snap ที่จำไว้
-        var original: CGRect? = nil
-        if let state = snapStates[key], Self.roughlyEqual(startFrame, state.snappedFrame) {
-            original = state.originalFrame
-        }
+        // ดึงออกจาก snap = หน้าต่างลอยขนาดมาตรฐาน: พื้นที่ราว 1/5 ของจอ (เดิมคืนขนาดก่อน snap ซึ่งมักใหญ่เกินไป
+        // หรือเป็นขนาดจากจออื่น) · นับว่า "อยู่ใน snap" เมื่อ Deft จัดไว้เอง หรือหน้าต่างใหญ่เกือบเต็มจอ
+        // (ขยายด้วย macOS เอง / Deft เพิ่งเปิด) — หน้าต่างธรรมดาที่ลากเฉย ๆ ไม่ถูกแตะ
+        let snapped = snapStates[key].map { Self.roughlyEqual(startFrame, $0.snappedFrame) } ?? false
         snapStates[key] = nil
-
-        // ไม่มีข้อมูล (ขยายด้วย macOS เอง / Deft เพิ่งเปิด / แอปเปิดใหม่) หรือขนาดเดิมก็ใหญ่เต็มจออยู่แล้ว —
-        // ถ้าหน้าต่างที่ลากอยู่ใหญ่เกือบเต็มจอ ให้ย่อเหลือครึ่งหนึ่งทั้งกว้างและสูง ไม่งั้นจะลากไปไหนหรือย่อต่อไม่ได้เลย
-        if let screen = Geometry.screen(containing: startFrame) {
-            let full = Self.isNearlyFull(startFrame, on: screen)
-            if original == nil || Self.isNearlyFull(original!, on: screen) {
-                guard full else { return }
-                original = CGRect(x: 0, y: 0, width: (startFrame.width / 2).rounded(),
-                                  height: (startFrame.height / 2).rounded())
-            }
-        }
-        guard let original, original.width > 40, original.height > 40 else { return }
+        guard let screen = Geometry.screen(containing: Geometry.toAppKit(point)) ?? Geometry.screen(containing: startFrame),
+              snapped || Self.isNearlyFull(startFrame, on: screen) else { return }
+        let original = CGRect(origin: .zero, size: Self.floatingSize(on: screen))
+        floatScreen = screen
         hideAllDividers()
 
         let ratioX = startFrame.width > 0 ? (mouseDownAt.x - startFrame.minX) / startFrame.width : 0.5
@@ -2256,6 +2256,34 @@ final class SnapManager {
         // ไม่ใช่ตอนตัดสินใจ เพราะระหว่างนั้นมือยังเลื่อนอยู่
         restartDrag(window: window, at: point, from: startFrame, to: original.size) { size in
             CGPoint(x: size.width * ratioX, y: offsetY)
+        }
+    }
+
+    /// ขนาดหน้าต่างหลังดึงออกจาก snap: พื้นที่ราว 1/5 ของพื้นที่ใช้งานของจอนั้น สัดส่วนกว้าง:สูง ≈ 1.42
+    /// (แบบหน้าต่างเบราว์เซอร์ทั่วไป) — จอ 2560×1440 ได้ราว 990×700 · ไม่เล็กกว่า 560×400 และไม่เกิน 90% ของจอ
+    fileprivate static func floatingSize(on screen: NSScreen) -> CGSize {
+        let area = screen.visibleFrame
+        let aspect: CGFloat = 1.42
+        let width = min(max((area.width * area.height * 0.2 * aspect).squareRoot(), 560), area.width * 0.9)
+        let height = min(max(width / aspect, 400), area.height * 0.9)
+        return CGSize(width: width.rounded(), height: height.rounded())
+    }
+
+    /// ดึงออกจาก snap แล้วไปปล่อยบน "อีกจอ" ที่ขนาดต่างกัน → ปรับเป็น 1/5 ของจอที่ปล่อย (ตอนดึงออกคิดจากจอต้นทาง)
+    /// ให้จุดที่เมาส์จับอยู่บนแถบบนอยู่ที่เดิมตามสัดส่วน และไม่ให้หลุดขอบจอ
+    private func refitFloating(window: AXUIElement, cursor: CGPoint) {
+        guard let from = floatScreen, let screen = Geometry.screen(containing: Geometry.toAppKit(cursor)),
+              screen !== from else { return }
+        let size = Self.floatingSize(on: screen)
+        let visible = Geometry.toCG(screen.visibleFrame)
+        axQueue.async {
+            guard let frame = AX.frame(of: window), frame.width > 0,
+                  abs(frame.width - size.width) > 8 || abs(frame.height - size.height) > 8 else { return }
+            let ratio = min(max((cursor.x - frame.minX) / frame.width, 0), 1)
+            var origin = CGPoint(x: cursor.x - size.width * ratio, y: frame.minY)
+            origin.x = min(max(origin.x, visible.minX), visible.maxX - size.width)
+            origin.y = min(max(origin.y, visible.minY), visible.maxY - size.height)
+            AX.setFrame(window, CGRect(origin: origin, size: size))
         }
     }
 
@@ -3795,7 +3823,7 @@ enum MasterSwitch {
         switch self {
         case .windowsSnap:
             // สวิตช์เดียวรวมทุกท่า snap: ลากชนขอบ/มุม · Snap Layouts · Snap Assist · เส้นแบ่ง
-            // · ลากออก=คืนขนาด · ลากขอบ=สูงเต็มจอ · ดับเบิลคลิก=เต็มจอ
+            // · ลากออก=หน้าต่างลอย 1/5 จอ · ลากขอบ=สูงเต็มจอ · ดับเบิลคลิก=เต็มจอ
             Config.snapLayouts = value
             Config.snapAssist = value
             Config.dividers = value
@@ -6725,8 +6753,8 @@ final class ManualWindow: NSWindow {
     private static let sections: [Section] = [
         ("Windows", "หน้าต่าง", [
             ("Windows Snap",
-             "Drag a window to a screen edge or corner to snap it to half, a quarter, or full screen. Includes Snap Layouts, Snap Assist, shared resize dividers, and Win+Arrow keys.",
-             "ลากหน้าต่างไปชนขอบหรือมุมจอเพื่อจัดเป็นครึ่งจอ เสี้ยวจอ หรือเต็มจอ มีแถบเลย์เอาต์ ตัวช่วยเลือกหน้าต่างอีกฝั่ง เส้นแบ่งปรับขนาดสองหน้าต่างพร้อมกัน เขย่าหน้าต่างเพื่อย่ออันอื่น และปุ่ม Win+ลูกศร"),
+             "Drag a window to a screen edge or corner to snap it to half, a quarter, or full screen. Includes Snap Layouts, Snap Assist, shared resize dividers, and Win+Arrow keys. Drag a snapped or maximized window away and it becomes a floating window about a fifth of the screen, sized for the display you drop it on.",
+             "ลากหน้าต่างไปชนขอบหรือมุมจอเพื่อจัดเป็นครึ่งจอ เสี้ยวจอ หรือเต็มจอ มีแถบเลย์เอาต์ ตัวช่วยเลือกหน้าต่างอีกฝั่ง เส้นแบ่งปรับขนาดสองหน้าต่างพร้อมกัน เขย่าหน้าต่างเพื่อย่ออันอื่น และปุ่ม Win+ลูกศร ลากหน้าต่างที่ snap หรือเต็มจออยู่ออกมา จะกลายเป็นหน้าต่างลอยขนาดราว 1/5 ของจอ โดยคิดตามจอที่ปล่อย"),
             ("Live Preview",
              "Shows real, moving thumbnails of your windows in the switcher, Snap Assist, and when hovering the Dock. Needs Screen Recording permission.",
              "แสดงภาพตัวอย่างหน้าต่างจริงแบบเคลื่อนไหวในตัวสลับหน้าต่าง ตัวช่วย Snap และตอนชี้ที่ Dock ต้องเปิดสิทธิ์ Screen Recording"),
