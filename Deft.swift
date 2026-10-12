@@ -30,6 +30,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import IOKit
 import IOKit.hidsystem
+import IOKit.ps
 import UniformTypeIdentifiers
 
 // MARK: - การตั้งค่าที่จำค่าไว้ข้ามการเปิดปิดแอป -----------------------------
@@ -6263,6 +6264,117 @@ final class MonitorTilesRow: MenuRowView {
     }
 }
 
+// MARK: - แบตเตอรี่ของเครื่องและอุปกรณ์ที่ต่ออยู่ ---------------------------------
+
+/// แบตเตอรี่ของ Mac เองและอุปกรณ์ที่ต่ออยู่ (เมาส์ คีย์บอร์ด หูฟัง ฯลฯ) — อ่านจากรายการ power source ของระบบ
+/// ตัวเดียวกับที่ `pmset -g accps` ใช้ จึงไม่ต้องขอสิทธิ์ Bluetooth และไม่ต้อง spawn โปรเซส
+/// ได้เฉพาะอุปกรณ์ที่รายงานแบตให้ macOS (ตัวที่เห็น % ในหน้า Bluetooth ของระบบ) · อุปกรณ์ที่ต่อผ่านดองเกิล USB
+/// ของผู้ผลิตเองมักไม่รายงาน
+enum DeviceBatteries {
+    struct Device {
+        let name: String
+        let symbol: String
+        let percent: Int
+        let charging: Bool
+    }
+
+    /// IOPSCopyPowerSourcesByType(0) = ทุกแหล่งรวมอุปกรณ์เสริม · ตัว public (IOPSCopyPowerSourcesInfo) ให้แค่แบตของเครื่อง
+    private typealias ByType = @convention(c) (Int32) -> Unmanaged<CFTypeRef>?
+    private static let copyAll: ByType? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "IOPSCopyPowerSourcesByType") else { return nil }
+        return unsafeBitCast(symbol, to: ByType.self)
+    }()
+
+    static func read() -> [Device] {
+        guard let blob = copyAll?(0)?.takeRetainedValue() ?? IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef] else { return [] }
+        var devices: [Device] = []
+        for source in sources {
+            guard let info = IOPSGetPowerSourceDescription(blob, source)?.takeUnretainedValue() as? [String: Any],
+                  (info["Is Present"] as? Bool) != false,
+                  let current = info["Current Capacity"] as? Int else { continue }
+            let maximum = max(1, (info["Max Capacity"] as? Int) ?? 100)
+            let percent = min(100, max(0, Int((Double(current) / Double(maximum) * 100).rounded())))
+            let isMac = (info["Type"] as? String) == "InternalBattery"
+            var name = (info["Name"] as? String) ?? ""
+            if isMac { name = "This Mac" } else if name.isEmpty { name = (info["Accessory Category"] as? String) ?? "Device" }
+            // หูฟังที่รายงานแยกข้าง/เคส (AirPods): ต่อท้ายชื่อด้วย L / R / Case
+            if let part = info["Part Identifier"] as? String, part != "Single" {
+                name += "  ·  " + (part == "Left" ? "L" : part == "Right" ? "R" : part)
+            }
+            let charging = (info["Is Charging"] as? Bool) == true
+                || (isMac && (info["Power Source State"] as? String) == "AC Power")
+            devices.append(Device(name: name, symbol: symbol(isMac: isMac, category: info["Accessory Category"] as? String),
+                                  percent: percent, charging: charging))
+        }
+        return devices
+    }
+
+    private static func symbol(isMac: Bool, category: String?) -> String {
+        if isMac { return "laptopcomputer" }
+        switch (category ?? "").lowercased() {
+        case let c where c.contains("mouse"):      return "computermouse"
+        case let c where c.contains("keyboard"):   return "keyboard"
+        case let c where c.contains("trackpad"):   return "rectangle.and.hand.point.up.left"
+        case let c where c.contains("head") || c.contains("audio") || c.contains("ear"): return "headphones"
+        case let c where c.contains("speaker"):    return "hifispeaker"
+        case let c where c.contains("game"):       return "gamecontroller"
+        case let c where c.contains("pencil") || c.contains("stylus"): return "pencil"
+        default:                                   return "battery.75percent"
+        }
+    }
+}
+
+/// แถวแบตเตอรี่หนึ่งอุปกรณ์: ไอคอน · ชื่อ … แถบ · % (สายฟ้า = กำลังชาร์จ) · เหลือน้อยเป็นส้ม ≤20% และแดง ≤10%
+final class BatteryRow: MenuRowView {
+    private let device: DeviceBatteries.Device
+
+    init(_ device: DeviceBatteries.Device) {
+        self.device = device
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 26))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var preferredWidth: CGFloat { 300 }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let left: CGFloat = 14, right = bounds.maxX - 14, midY = bounds.midY
+        if let icon = NSImage(systemSymbolName: device.symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))) {
+            icon.draw(in: NSRect(x: left + 9 - icon.size.width / 2, y: midY - icon.size.height / 2,
+                                 width: icon.size.width, height: icon.size.height))
+        }
+
+        // ขวาสุด: ตัวเลข % (กว้างคงที่ให้แถบของทุกแถวตรงกัน) แล้วแถบอยู่ทางซ้ายของมัน
+        let low = device.percent <= 20
+        let tint: NSColor = device.percent <= 10 ? .systemRed : low ? .systemOrange : .systemGreen
+        let value = "\(device.percent)%" + (device.charging ? " ⚡︎" : "")
+        let valueAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: low ? tint : NSColor.labelColor,
+        ]
+        let valueSize = (value as NSString).size(withAttributes: valueAttributes)
+        (value as NSString).draw(at: NSPoint(x: right - valueSize.width, y: midY - valueSize.height / 2),
+                                 withAttributes: valueAttributes)
+
+        let track = NSRect(x: right - 54 - 42, y: midY - 2.5, width: 42, height: 5)
+        NSColor.labelColor.withAlphaComponent(0.12).setFill()
+        NSBezierPath(roundedRect: track, xRadius: 2.5, yRadius: 2.5).fill()
+        tint.setFill()
+        let fill = NSRect(x: track.minX, y: track.minY, width: max(5, track.width * CGFloat(device.percent) / 100), height: track.height)
+        NSBezierPath(roundedRect: fill, xRadius: 2.5, yRadius: 2.5).fill()
+
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        let nameAttributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12),
+                                                             .foregroundColor: NSColor.labelColor, .paragraphStyle: style]
+        let nameX = left + 26
+        (device.name as NSString).draw(in: NSRect(x: nameX, y: midY - 8, width: track.minX - 10 - nameX, height: 16),
+                                       withAttributes: nameAttributes)
+    }
+}
+
 /// status item ตัวที่สองทางซ้ายไอคอน Deft แสดงช่อง CPU · RAM · SSD คลิกแล้วเห็นรายละเอียด
 /// อ่านค่าจาก Mach โดยตรง ไม่ต้อง spawn โปรเซสและไม่ต้องขอสิทธิ์
 final class SystemMonitor: NSObject {
@@ -6586,6 +6698,13 @@ final class SystemMonitor: NSObject {
         let tilesRow = MonitorTilesRow(tiles: tiles())
         self.tilesRow = tilesRow
         rows.append(tilesRow)
+        // แบตเตอรี่ของเครื่องและอุปกรณ์ที่ต่ออยู่ — ไม่มีอะไรรายงานแบต (Mac ตั้งโต๊ะ ไม่มีอุปกรณ์) ก็ไม่ต้องมีหมวดนี้
+        let batteries = DeviceBatteries.read()
+        if !batteries.isEmpty {
+            rows.append(MenuSeparatorRow())
+            rows.append(MenuHeaderLabelRow(symbol: "battery.75percent", text: "Batteries", badge: nil))
+            rows.append(contentsOf: batteries.map { BatteryRow($0) })
+        }
         if AIUsage.shared.showing {
             rows.append(MenuSeparatorRow())
             rows.append(contentsOf: AIUsage.shared.detailRows())
@@ -6794,8 +6913,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
             ("CPU · RAM · SSD · Temperature",
-             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open.",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู"),
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging).",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ)"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
