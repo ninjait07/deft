@@ -199,15 +199,20 @@ enum AX {
         return CGRect(origin: origin, size: size)
     }
 
+    /// ขนาด → ตำแหน่ง → ขนาด → ตำแหน่ง
+    /// ต้องย่อ "ก่อน" ย้าย: ถ้าย้ายหน้าต่างที่ใหญ่กว่าจอปลายทางไปวางก่อน (ลากจากจอใหญ่ไปเต็มจอบนจอเล็ก)
+    /// macOS จะบีบความสูงให้เอง แล้วไม่ยอมให้เปลี่ยนความกว้างอีก — หน้าต่างกว้างเท่าเดิม ล้นจอออกไปสองข้าง
+    /// (เดิมสั่ง ตำแหน่ง → ขนาด เลยเจออาการนี้) · รอบสองไว้สำหรับกรณีตรงข้าม: ตอนต้องขยาย ขนาดรอบแรกอาจถูกตัด
+    /// ไม่ให้ล้นจอที่หน้าต่างอยู่ตอนนั้น พอย้ายไปถูกที่แล้วสั่งขนาดอีกทีจึงได้ครบ แล้วปิดท้ายด้วยตำแหน่งกันแอปดันกลับ
     static func setFrame(_ window: AXUIElement, _ rect: CGRect) {
         for _ in 0..<2 {
             var origin = rect.origin
             var size = rect.size
-            if let value = AXValueCreate(.cgPoint, &origin) {
-                AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
-            }
             if let value = AXValueCreate(.cgSize, &size) {
                 AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
+            }
+            if let value = AXValueCreate(.cgPoint, &origin) {
+                AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
             }
         }
     }
@@ -2191,13 +2196,23 @@ final class SnapManager {
             }
             AX.setFrame(window, rect)
 
-            // บางแอปไม่ยอมรับขนาดที่สั่ง เช่นโปรแกรมดูหนังที่ล็อกอัตราส่วนภาพไว้ตามวิดีโอ
-            // หรือหน้าต่างที่มีขนาดต่ำสุดใหญ่กว่าโซน — ปล่อยไว้มันจะไปกองอยู่มุมโซน
-            // แล้วเหลือช่องว่างข้างล่างดูเหมือนจัดไม่ติด จัดกลางโซนให้แทนจะดูตั้งใจกว่า
-            if let actual = AX.frame(of: window),
-               abs(actual.width - rect.width) > 8 || abs(actual.height - rect.height) > 8 {
-                AX.setPosition(window, CGPoint(x: rect.midX - actual.width / 2,
-                                               y: rect.midY - actual.height / 2))
+            // ขนาดไม่ตรงที่สั่ง — มีสองแบบ:
+            // (1) ลากหน้าต่างจากจอใหญ่มาปล่อยบนจอที่เล็กกว่า: หน้าต่างที่ใหญ่กว่าจอและวางชิดมุมจอ macOS ไม่ยอมให้
+            //     ย่อความกว้าง (บีบแค่ความสูงให้เอง) หน้าต่างเลยกว้างเท่าเดิมล้นจอ · ขยับไปไว้กลางโซนก่อนแล้วสั่งใหม่จะย่อได้
+            // (2) แอปไม่ยอมรับขนาดจริง ๆ เช่นโปรแกรมดูหนังที่ล็อกอัตราส่วนภาพ หรือขนาดต่ำสุดใหญ่กว่าโซน —
+            //     สั่งใหม่ก็ไม่ได้ผล ปล่อยไว้กลางโซนจะดูตั้งใจกว่าไปกองอยู่มุม
+            func mismatch() -> CGRect? {
+                guard let actual = AX.frame(of: window),
+                      abs(actual.width - rect.width) > 8 || abs(actual.height - rect.height) > 8 else { return nil }
+                return actual
+            }
+            func centre(_ actual: CGRect) {
+                AX.setPosition(window, CGPoint(x: rect.midX - actual.width / 2, y: rect.midY - actual.height / 2))
+            }
+            if let actual = mismatch() {
+                centre(actual)
+                AX.setFrame(window, rect)
+                if let still = mismatch() { centre(still) }
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
