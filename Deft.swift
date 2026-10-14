@@ -77,6 +77,13 @@ enum Config {
     @StoredBool(key: "snapAssist", fallback: true)         static var snapAssist: Bool
     @StoredBool(key: "dividers", fallback: true)           static var dividers: Bool
     @StoredBool(key: "windowMemory", fallback: true)       static var windowMemory: Bool
+    /// ดับเบิลคลิกรูปแล้วเปิดทั้งโฟลเดอร์ใน Preview — เปิดเมื่อไหร่ Deft ตั้งตัวเองเป็นแอปเปิดรูป
+    @StoredBool(key: "photoBrowse", fallback: false)       static var photoBrowse: Bool
+    /// แอปเปิดรูปเดิมก่อน Deft รับเปิดรูป: ชนิดไฟล์ → path ของแอป (ปิดสวิตช์แล้วส่งรูปต่อให้แอปนี้)
+    static var photoHandlers: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "photoHandlers") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "photoHandlers") }
+    }
     @StoredBool(key: "altTab", fallback: true)             static var altTab: Bool
     @StoredBool(key: "windowPreviews", fallback: true)     static var windowPreviews: Bool
     @StoredBool(key: "snapEnabled", fallback: true)        static var snapEnabled: Bool
@@ -123,7 +130,7 @@ enum Config {
     @StoredBool(key: "monitorRAM", fallback: true)           static var monitorRAM: Bool
     @StoredBool(key: "monitorSSD", fallback: true)           static var monitorSSD: Bool
     @StoredBool(key: "monitorTemp", fallback: true)          static var monitorTemp: Bool
-    /// อุปกรณ์ที่เลือกให้ขึ้นช่องแบตเตอรี่บนเมนูบาร์: id → ชื่อ (เก็บชื่อไว้โชว์ในเมนูตอนอุปกรณ์นั้นไม่ได้ต่ออยู่)
+    /// อุปกรณ์ที่เลือกให้ขึ้นช่องแบตเตอรี่บนเมนูบาร์: id → ชื่อ (จำไว้แม้อุปกรณ์ไม่ได้ต่ออยู่ พอกลับมาต่อก็ขึ้นตามเดิม)
     static var batteryDevices: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: "batteryDevices") as? [String: String] ?? [:] }
         set { UserDefaults.standard.set(newValue, forKey: "batteryDevices") }
@@ -3965,11 +3972,362 @@ enum KeyboardStyle {
     }
 }
 
+// MARK: - ดูรูปทั้งโฟลเดอร์ ---------------------------------------------------------
+
+/// ดับเบิลคลิกรูปเดียวแล้วเลื่อนดูรูปอื่นในโฟลเดอร์เดียวกันต่อได้ แบบ Photos ของ Windows
+/// Preview เปิดแค่ไฟล์ที่ถูกส่งไปให้ เลยให้ Deft เป็นแอปเปิดรูปของระบบแทน (ตอนเปิดสวิตช์) รับไฟล์มาแล้วส่งรูป
+/// ทั้งโฟลเดอร์ให้ Preview ทีเดียว (Preview รวมเป็นหน้าต่างเดียวมีแถบรูปย่อ) จากนั้นส่งรูปที่คลิกซ้ำ
+/// Preview จะกระโดดไปรูปนั้นในหน้าต่างเดิม · ปิดสวิตช์ = ส่งรูปต่อให้แอปเดิมทีละรูปเหมือนเดิม
+enum PhotoBrowse {
+    /// ชนิดรูปที่ Deft รับเปิด — ต้องตรงกับ CFBundleDocumentTypes ใน build.sh
+    static let typeIDs = ["public.png", "public.jpeg", "public.heic", "public.heif", "com.compuserve.gif",
+                          "public.tiff", "com.microsoft.bmp", "org.webmproject.webp", "public.avif"]
+    /// โฟลเดอร์ที่มีรูปเยอะมาก ส่งไปแค่ชุดละ 200 รูป (ชุดที่มีรูปที่คลิก) Preview จะได้ไม่อืด
+    private static let limit = 200
+    private static let queue = DispatchQueue(label: "deft.photos")
+
+    private static var previewURL: URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Preview")
+    }
+
+    /// Deft เป็นแอปเปิดรูปของระบบอยู่ไหม (ดูจาก JPEG) — ผู้ใช้เปลี่ยนกลับเองใน Get Info ได้ สวิตช์ต้องตามของจริง
+    static var isHandler: Bool {
+        guard let jpeg = UTType("public.jpeg"),
+              let app = NSWorkspace.shared.urlForApplication(toOpen: jpeg) else { return false }
+        return app.standardizedFileURL == Bundle.main.bundleURL.standardizedFileURL
+    }
+
+    /// ไฟล์ที่ระบบส่งมาให้ Deft เปิด (ดับเบิลคลิก, Open With, ลากใส่ไอคอน)
+    static func open(_ urls: [URL]) {
+        // ห้ามส่งกลับไปให้ NSWorkspace เลือกแอปเอง — Deft เป็นแอปเปิดรูปอยู่ จะวนกลับมาที่ Deft
+        guard let preview = previewURL else { knackLog("photos: Preview not found"); return }
+        let config = NSWorkspace.OpenConfiguration()
+        guard Config.photoBrowse else { passThrough(urls, fallback: preview); return }
+        guard urls.count == 1, let clicked = urls.first else {
+            NSWorkspace.shared.open(urls, withApplicationAt: preview, configuration: config)
+            return
+        }
+        let album = siblings(of: clicked)
+        guard album.count > 1 else {
+            NSWorkspace.shared.open(urls, withApplicationAt: preview, configuration: config)
+            return
+        }
+        NSWorkspace.shared.open(album, withApplicationAt: preview, configuration: config) { _, _ in
+            queue.async { follow(clicked, in: album, preview: preview) }
+        }
+    }
+
+    /// พา Preview ไปที่รูปที่คลิก (ส่งรูปนั้นซ้ำ Preview จะกระโดดไปในหน้าต่างรวม) — ต้องรอหน้าต่างรวมโผล่ก่อน
+    /// ส่งเร็วไปรูปที่คลิกจะเด้งแยกเป็นอีกหน้าต่าง · รูปเยอะ Preview ยุ่งอยู่หลายวินาทีจนตอบ Accessibility ไม่ทัน
+    /// เลยวนรอบนคิวเบื้องหลัง (ถ้ารอบน main เมาส์/คีย์บอร์ดที่ Deft ดักอยู่จะหน่วงตาม) · ส่งได้ไม่เกิน 3 ครั้ง
+    /// จะได้ไม่แย่งผู้ใช้ที่กดเลื่อนรูปเองไปแล้ว
+    private static func follow(_ clicked: URL, in album: [URL], preview: URL) {
+        let target = clicked.resolvingSymlinksInPath().path
+        let paths = Set(album.map { $0.resolvingSymlinksInPath().path })
+        let start = Date()
+        var sends: [Date] = []
+        while Date().timeIntervalSince(start) < 20, sends.count < 3 {
+            let shown = documentsShown()
+            if shown.contains(target) { return }
+            if !shown.isDisjoint(with: paths), sends.last.map({ Date().timeIntervalSince($0) > 1.5 }) ?? true {
+                NSWorkspace.shared.open([clicked], withApplicationAt: preview, configuration: NSWorkspace.OpenConfiguration())
+                sends.append(Date())
+            }
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+    }
+
+    /// รูปที่หน้าต่าง Preview แต่ละบานกำลังโชว์อยู่ (path) — Preview ยุ่งอยู่ก็ได้ชุดว่าง
+    private static func documentsShown() -> Set<String> {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Preview").first else { return [] }
+        let element = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(element, 1.0)
+        guard let windows = AX.attribute(element, kAXWindowsAttribute) as? [AXUIElement] else { return [] }
+        return Set(windows.compactMap { window in
+            AXUIElementSetMessagingTimeout(window, 1.0)
+            return AX.string(window, kAXDocumentAttribute).flatMap(URL.init(string:))?.resolvingSymlinksInPath().path
+        })
+    }
+
+    /// รูปทุกรูปในโฟลเดอร์เดียวกัน เรียงตามชื่อแบบ Finder
+    private static func siblings(of file: URL) -> [URL] {
+        let keys: Set<URLResourceKey> = [.contentTypeKey, .isRegularFileKey]
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: file.deletingLastPathComponent(), includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]) else { return [file] }
+        let images = items.filter { url in
+            guard let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true,
+                  let type = values.contentType else { return false }
+            return type.conforms(to: .image) && !type.conforms(to: .svg)
+        }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        let target = file.resolvingSymlinksInPath().path
+        guard let index = images.firstIndex(where: { $0.resolvingSymlinksInPath().path == target }) else { return [file] }
+        // แบ่งเป็นชุดตายตัว ไม่ใช่ช่วงรอบรูปที่คลิก — คลิกรูปไหนในชุดเดียวกันก็ได้ชุดเดิม Preview จะใช้หน้าต่างเดิม
+        // (ช่วงที่เลื่อนตามรูปทับกับหน้าต่างเก่าบางส่วน Preview จะแตกเป็นหลายหน้าต่าง)
+        let start = index / limit * limit
+        return Array(images[start ..< min(start + limit, images.count)])
+    }
+
+    /// สวิตช์ปิดอยู่แต่ Deft ยังเป็นแอปเปิดรูป → ส่งแต่ละไฟล์ต่อให้แอปที่เคยเปิดชนิดนั้นก่อน Deft (ไม่มีก็ Preview)
+    private static func passThrough(_ urls: [URL], fallback: URL) {
+        let saved = Config.photoHandlers
+        var groups: [URL: [URL]] = [:]
+        for url in urls {
+            let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+            let id = typeIDs.first { id in type.map { $0.conforms(to: UTType(id) ?? .data) } ?? false }
+            let original = id.flatMap { saved[$0] }.map { URL(fileURLWithPath: $0) }
+                .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+            groups[original ?? fallback, default: []].append(url)
+        }
+        for (app, files) in groups {
+            NSWorkspace.shared.open(files, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    /// เปิด = ตั้ง Deft เป็นแอปเปิดรูปทุกชนิดในรายการ (จำแอปเดิมไว้) · ปิด = ไม่คืน เพราะ macOS ให้ผู้ใช้กดยืนยันทุกชนิด
+    /// ทีละหน้าต่าง (9 ครั้ง) — Deft ยังรับไฟล์อยู่แต่ส่งต่อให้แอปเดิมทีละรูปเหมือนก่อนเปิด (passThrough)
+    /// อยากคืนเต็มที่ใช้ Get Info → Open with → Change All ใน Finder
+    static func apply(_ on: Bool) {
+        guard on else { return }
+        let me = Bundle.main.bundleURL.standardizedFileURL
+        var saved = Config.photoHandlers
+        for id in typeIDs {
+            guard let type = UTType(id) else { continue }
+            let current = NSWorkspace.shared.urlForApplication(toOpen: type)?.standardizedFileURL
+            guard current != me else { continue }
+            if let current { saved[id] = current.path }
+            NSWorkspace.shared.setDefaultApplication(at: me, toOpen: type) { error in
+                if let error { knackLog("photos: could not open \(id) with Deft: \(error.localizedDescription)") }
+            }
+        }
+        Config.photoHandlers = saved
+    }
+}
+
+// MARK: - ปุ่มตั้งวอลเปเปอร์บน Preview ------------------------------------------------
+
+/// ปุ่มกลมลอยอยู่ในแถบเครื่องมือของ Preview (ซ้ายของปุ่มซูม) ตอนดูรูป — กดแล้วตั้งรูปที่เปิดอยู่เป็นวอลเปเปอร์
+/// แบบปุ่ม "Set as background" ของ Photos บน Windows · Preview ใส่ปุ่มเพิ่มเองไม่ได้ เลยวางแผงของ Deft ทับตรงนั้น
+/// มาพร้อม Browse Folder Photos · อ่านตำแหน่งจาก Accessibility บนคิวเบื้องหลังทุก 0.25 วินาทีเฉพาะตอน Preview อยู่หน้า
+/// (Preview โหลดรูปเยอะ ๆ แล้วตอบช้า ถ้าอ่านบน main เมาส์/คีย์บอร์ดที่ Deft ดักอยู่จะหน่วงตาม)
+final class WallpaperButton {
+    static let shared = WallpaperButton()
+
+    private let queue = DispatchQueue(label: "deft.wallpaper-button")
+    private var timer: DispatchSourceTimer?
+    private var observer: NSObjectProtocol?
+    private var panel: WallpaperPanel?
+    /// รูปที่หน้าต่าง Preview ด้านหน้ากำลังโชว์
+    private var document: URL?
+    /// กรอบหน้าต่างรอบก่อน — ยังขยับ/ย่อขยายอยู่ก็ซ่อนไว้ก่อน ปุ่มจะได้ไม่วิ่งตามช้า ๆ
+    private var lastWindowFrame: CGRect?
+
+    private static let previewID = "com.apple.Preview"
+    private static let size: CGFloat = 38
+
+    /// เรียกตอนเปิดแอปและตอนสับสวิตช์ Browse Folder Photos
+    func refresh() {
+        if Config.photoBrowse, observer == nil {
+            observer = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+            ) { [weak self] _ in self?.frontChanged() }
+        } else if !Config.photoBrowse, let observer {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            self.observer = nil
+        }
+        frontChanged()
+    }
+
+    private func frontChanged() {
+        let previewFront = Config.photoBrowse
+            && NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.previewID
+        if previewFront {
+            guard timer == nil else { return }
+            let source = DispatchSource.makeTimerSource(queue: queue)
+            source.schedule(deadline: .now(), repeating: 0.25)
+            source.setEventHandler { [weak self] in self?.tick() }
+            source.resume()
+            timer = source
+        } else {
+            timer?.cancel()
+            timer = nil
+            lastWindowFrame = nil
+            panel?.orderOut(nil)
+        }
+    }
+
+    /// (คิวเบื้องหลัง) หาตำแหน่งปุ่มจากหน้าต่าง Preview ด้านหน้า แล้วส่งไปวาดบน main
+    private func tick() {
+        let spot = locate()
+        DispatchQueue.main.async { [weak self] in self?.place(spot) }
+    }
+
+    private func locate() -> (rect: NSRect, document: URL)? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.previewID).first
+        else { return nil }
+        let element = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(element, 0.3)
+        guard let raw = AX.attribute(element, kAXFocusedWindowAttribute) else { return nil }
+        let window = raw as! AXUIElement
+        AXUIElementSetMessagingTimeout(window, 0.3)
+        guard !AX.isFullScreen(window),
+              let documentURL = AX.string(window, kAXDocumentAttribute).flatMap(URL.init(string:)),
+              (try? documentURL.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .image) == true,
+              let frame = AX.frame(of: window) else { return nil }
+
+        // ชื่อไฟล์เป็นข้อความยืดเต็มช่องว่างจากซ้ายจนชนปุ่มแรกของแถบเครื่องมือ → ปลายขวาของมันคือจุดวางปุ่ม
+        let children = AX.attribute(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
+        let titles = children.filter { AX.string($0, kAXRoleAttribute) == (kAXStaticTextRole as String) }
+            .compactMap { AX.frame(of: $0) }
+        guard let toolbar = children.first(where: { AX.string($0, kAXRoleAttribute) == "AXToolbar" }),
+              let bar = AX.frame(of: toolbar), let title = titles.max(by: { $0.maxX < $1.maxX }),
+              title.maxX > frame.minX, title.maxX < frame.maxX else { return nil }
+
+        let rect = CGRect(x: title.maxX - 8 - Self.size, y: bar.midY - Self.size / 2,
+                          width: Self.size, height: Self.size)
+        // ชื่อไฟล์ยาวจนชนปุ่ม (หน้าต่างแคบ) → ไม่โชว์ ดีกว่าบังชื่อ
+        let name = (AX.string(window, kAXTitleAttribute) ?? "").components(separatedBy: " – ").first ?? ""
+        let nameWidth = (name as NSString).size(withAttributes: [.font: NSFont.boldSystemFont(ofSize: 13)]).width
+        guard title.minX + nameWidth + 12 < rect.minX else { return nil }
+        return (Geometry.toAppKit(rect), documentURL)
+    }
+
+    private func place(_ spot: (rect: NSRect, document: URL)?) {
+        guard timer != nil, let spot else {
+            lastWindowFrame = nil
+            panel?.orderOut(nil)
+            return
+        }
+        document = spot.document
+        let moving = lastWindowFrame.map { $0 != spot.rect } ?? true
+        lastWindowFrame = spot.rect
+        let panel = self.panel ?? makePanel()
+        if moving { panel.orderOut(nil); return }
+        if panel.frame != spot.rect { panel.setFrame(spot.rect, display: true) }
+        if !panel.isVisible { panel.orderFrontRegardless() }
+    }
+
+    private func makePanel() -> WallpaperPanel {
+        let panel = WallpaperPanel(size: Self.size)
+        panel.onClick = { [weak self] in self?.clicked() }
+        self.panel = panel
+        return panel
+    }
+
+    // MARK: ตั้งวอลเปเปอร์
+
+    private func clicked() {
+        guard let panel, let url = document else { return }
+        let here = NSScreen.screens.first { $0.frame.intersects(panel.frame) } ?? NSScreen.main
+        guard NSScreen.screens.count > 1 else { setWallpaper(url, on: NSScreen.screens); return }
+        let menu = NSMenu()
+        // หัวข้อ "Set as Wallpaper" แล้วเลือกจอ — จอนี้มาก่อน เพราะใช้บ่อยกว่า
+        let header: NSMenuItem
+        if #available(macOS 14.0, *) {
+            header = .sectionHeader(title: "Set as Wallpaper")
+        } else {
+            header = NSMenuItem(title: "Set as Wallpaper", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+        }
+        let this = NSMenuItem(title: "This Display", action: nil, keyEquivalent: "")
+        let all = NSMenuItem(title: "All Displays", action: nil, keyEquivalent: "")
+        menu.addItem(header)
+        menu.addItem(this)
+        menu.addItem(all)
+        let target = MenuActionTarget { [weak self] item in
+            self?.setWallpaper(url, on: item === all ? NSScreen.screens : [here].compactMap { $0 })
+        }
+        for item in [all, this] {
+            item.target = target
+            item.action = #selector(MenuActionTarget.fire(_:))
+        }
+        withExtendedLifetime(target) {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -6), in: panel.contentView)
+        }
+    }
+
+    private func setWallpaper(_ url: URL, on screens: [NSScreen]) {
+        // เต็มจอแบบ Fill: ขยายตามสัดส่วนจนเต็ม ส่วนเกินตัดทิ้ง (แบบเดียวกับค่าเริ่มต้นใน System Settings)
+        let options: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
+            .allowClipping: true,
+        ]
+        var failed = false
+        for screen in screens {
+            do { try NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: options) }
+            catch { failed = true; knackLog("wallpaper: \(error.localizedDescription)") }
+        }
+        panel?.flash(success: !failed)
+    }
+}
+
+/// ตัวรับคำสั่งจาก NSMenuItem แบบ closure
+final class MenuActionTarget: NSObject {
+    private let handler: (NSMenuItem) -> Void
+    init(_ handler: @escaping (NSMenuItem) -> Void) { self.handler = handler }
+    @objc func fire(_ sender: NSMenuItem) { handler(sender) }
+}
+
+/// แผงกลมใส ๆ หน้าตาเหมือนปุ่มบนแถบเครื่องมือของ Preview
+final class WallpaperPanel: NSPanel {
+    var onClick: (() -> Void)?
+    private let icon = NSImageView()
+    private static let symbol = "photo.artframe"
+
+    init(size: CGFloat) {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: size, height: size),
+                   styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        level = .floating
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        animationBehavior = .none
+
+        let content = ClickView(frame: NSRect(x: 0, y: 0, width: size, height: size))
+        content.onClick = { [weak self] in self?.onClick?() }
+        content.toolTip = "Set as Wallpaper"
+        icon.frame = content.bounds.insetBy(dx: 9, dy: 9)
+        icon.autoresizingMask = [.width, .height]
+        icon.symbolConfiguration = .init(pointSize: 15, weight: .regular)
+        icon.contentTintColor = .labelColor
+        showIcon(Self.symbol)
+        content.addSubview(icon)
+        let wrapped = GlassBackdrop.wrap(content, cornerRadius: size / 2, frosted: true)
+        wrapped.frame = content.frame
+        contentView = wrapped
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    private func showIcon(_ name: String) {
+        icon.image = NSImage(systemSymbolName: name, accessibilityDescription: "Set as Wallpaper")
+    }
+
+    /// ติ๊กถูก (หรือกากบาทถ้าตั้งไม่ได้) ครู่หนึ่ง ให้รู้ว่าตั้งแล้ว
+    func flash(success: Bool) {
+        showIcon(success ? "checkmark" : "xmark")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.showIcon(Self.symbol) }
+    }
+
+    private final class ClickView: NSView {
+        var onClick: (() -> Void)?
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func mouseDown(with event: NSEvent) {}
+        override func mouseUp(with event: NSEvent) {
+            if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+        }
+    }
+}
+
 // MARK: - สวิตช์ใหญ่ (ใช้ร่วมกันทั้งเมนูบาร์และหน้าตั้งค่า) --------------------------
 
 /// แต่ละตัวคุมฟีเจอร์ทั้งกลุ่ม — ไม่มีสวิตช์ย่อยให้ปรับอีก
 enum MasterSwitch {
-    case windowsSnap, livePreview
+    case windowsSnap, livePreview, photoBrowse
     case windowsShortcuts, autoKeyboard, keyboardClean
     case mouseNatural, trackpadNatural, mouseSideButtons
     case monitorCPU, monitorRAM, monitorSSD, monitorTemp, aiUsage
@@ -3980,6 +4338,7 @@ enum MasterSwitch {
         switch self {
         case .windowsSnap:      return SnapManager.shared.isEnabled
         case .livePreview:      return Config.windowPreviews
+        case .photoBrowse:      return Config.photoBrowse && PhotoBrowse.isHandler
         case .windowsShortcuts: return KeyboardStyle.windowsActive
         case .autoKeyboard:     return Config.perKeyboard
         case .keyboardClean:    return KeyboardClean.shared.isOn
@@ -4016,6 +4375,10 @@ enum MasterSwitch {
             Config.dockPeek = value
             DockPeek.shared.refresh()
             if value { AppDelegate.shared?.ensureScreenRecording() }
+        case .photoBrowse:
+            Config.photoBrowse = value
+            PhotoBrowse.apply(value)
+            WallpaperButton.shared.refresh()
         case .windowsShortcuts:
             // สับสวิตช์เองเมื่อไหร่ = เลือกเองแล้ว เลิกให้ Auto ตัดสินให้
             Config.perKeyboard = false
@@ -7204,6 +7567,9 @@ final class ManualWindow: NSWindow {
             ("Live Preview",
              "Shows real, moving thumbnails of your windows in the switcher, Snap Assist, and when hovering the Dock. Needs Screen Recording permission.",
              "แสดงภาพตัวอย่างหน้าต่างจริงแบบเคลื่อนไหวในตัวสลับหน้าต่าง ตัวช่วย Snap และตอนชี้ที่ Dock ต้องเปิดสิทธิ์ Screen Recording"),
+            ("Browse Folder Photos",
+             "Preview normally opens only the photo you double-click. With this on, double-clicking a photo opens every photo in the same folder in one Preview window, starting at the one you clicked, so the arrow keys flip through the rest like Windows Photos. While you view a photo, a round Set as Wallpaper button sits in Preview's toolbar, left of the zoom buttons; with more than one display it asks whether to use this display or all of them. Selecting several photos first opens just those. To do this Deft becomes the app that opens PNG, JPEG, HEIC, GIF, TIFF, BMP, WebP and AVIF files and passes them straight to Preview. Turn it off and Deft hands each photo, on its own, to the app that opened it before. To take a file type away from Deft entirely, use Finder's Get Info → Open with → Change All.",
+             "ปกติ Preview เปิดแค่รูปที่ดับเบิลคลิก เมื่อเปิดตัวเลือกนี้ ดับเบิลคลิกรูปไหนจะเปิดรูปทั้งโฟลเดอร์ใน Preview หน้าต่างเดียว เริ่มที่รูปที่คลิก แล้วกดลูกศรเลื่อนดูรูปอื่นได้เหมือน Photos ของ Windows ระหว่างดูรูปจะมีปุ่มกลม Set as Wallpaper ในแถบเครื่องมือของ Preview (ซ้ายปุ่มซูม) กดแล้วตั้งรูปนั้นเป็นวอลเปเปอร์ ถ้ามีหลายจอจะให้เลือกจอนี้หรือทุกจอ ถ้าเลือกหลายรูปก่อนเปิดจะเปิดเฉพาะรูปที่เลือก การทำแบบนี้ Deft จะตั้งตัวเองเป็นแอปเปิดไฟล์ PNG, JPEG, HEIC, GIF, TIFF, BMP, WebP และ AVIF แล้วส่งต่อให้ Preview ทันที ปิดตัวเลือกนี้ Deft จะส่งรูปต่อให้แอปที่เคยเปิดทีละรูปเหมือนเดิม ถ้าอยากให้ชนิดไฟล์ไหนไม่ผ่าน Deft เลย ใช้ Get Info → Open with → Change All ใน Finder"),
         ]),
         ("Keyboard", "คีย์บอร์ด", [
             ("Windows Shortcuts",
@@ -7240,8 +7606,8 @@ final class ManualWindow: NSWindow {
         ]),
         ("System Monitor", "มอนิเตอร์ระบบ", [
             ("CPU · RAM · SSD · Temperature",
-             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging). The Battery section of Deft's menu lists every device it finds; switch one on and it gets its own cell on the menu bar, grouped in a separate zone.",
-             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ) หมวด Battery ในเมนูของ Deft จะแสดงอุปกรณ์ทุกตัวที่เจอ เปิดสวิตช์ของตัวไหน ตัวนั้นก็ขึ้นเป็นช่องบนแถบเมนู แยกเป็นโซนของตัวเอง"),
+             "Shows live CPU load, memory in use, disk activity and temperature right in the menu bar. Toggle each independently; click a cell for details. Temperature is the hottest CPU core in °C, read from the chip's own sensors — the cell turns orange above about 81°C and red above about 93°C (Apple Silicon slows itself down near 100°C). Clicking shows all four at once, whichever cells you chose for the menu bar: CPU with user/system split and core types, memory with swap, SSD read/write speed and free space, and SSD and battery temperatures with macOS's thermal state. The details update live while open. A Batteries section lists this Mac and every connected device that reports its battery to macOS — mouse, keyboard, headphones — with a bar and percentage (orange at 20%, red at 10%, ⚡ while charging). The Battery section of Deft's menu lists every device it finds; switch one on and it gets its own cell on the menu bar, grouped in a separate zone. A device that is not connected is left out of the list; Deft keeps its setting, so it shows up again the way you set it when it reconnects.",
+             "แสดงการใช้งาน CPU หน่วยความจำที่ใช้ การทำงานของดิสก์ และอุณหภูมิ สด ๆ บนแถบเมนู เปิด/ปิดแยกกันได้ คลิกที่ช่องเพื่อดูรายละเอียด อุณหภูมิคือค่าของคอร์ CPU ที่ร้อนที่สุด (°C) อ่านจากเซ็นเซอร์ของชิปโดยตรง ช่องจะเป็นสีส้มเมื่อเกินประมาณ 81°C และสีแดงเมื่อเกินประมาณ 93°C (ชิป Apple Silicon จะลดความเร็วตัวเองเมื่อใกล้ 100°C) คลิกแล้วจะเห็นครบทั้ง 4 ค่าเสมอ ไม่ว่าบนแถบเมนูจะเลือกช่องไหนไว้: CPU แยก User/System และชนิดคอร์ หน่วยความจำกับ swap ความเร็วอ่าน/เขียน SSD และพื้นที่ว่าง อุณหภูมิ SSD แบตเตอรี่ และสถานะความร้อนของระบบ ตัวเลขอัปเดตสดระหว่างเปิดดู มีหมวด Batteries แสดงแบตเตอรี่ของ Mac เครื่องนี้และอุปกรณ์ที่ต่ออยู่ที่รายงานแบตให้ macOS เช่น เมาส์ คีย์บอร์ด หูฟัง พร้อมแถบและเปอร์เซ็นต์ (ส้มเมื่อเหลือ 20% แดงเมื่อเหลือ 10% และมี ⚡ ตอนกำลังชาร์จ) หมวด Battery ในเมนูของ Deft จะแสดงอุปกรณ์ทุกตัวที่เจอ เปิดสวิตช์ของตัวไหน ตัวนั้นก็ขึ้นเป็นช่องบนแถบเมนู แยกเป็นโซนของตัวเอง อุปกรณ์ที่ไม่ได้เชื่อมต่อจะไม่ขึ้นในรายการ แต่ Deft ยังจำค่าที่ตั้งไว้ พอกลับมาเชื่อมต่อก็แสดงตามที่ตั้งไว้เหมือนเดิม"),
         ]),
         ("Display", "จอภาพ", [
             ("Per-display controls",
@@ -8277,6 +8643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var trustTimer: Timer?
     private var engineStarted = false
 
+    /// รูปที่ระบบส่งมาให้เปิด (Deft เป็นแอปเปิดรูปตอนเปิด Browse Folder Photos)
+    func application(_ application: NSApplication, open urls: [URL]) {
+        PhotoBrowse.open(urls)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         Config.migrate()
@@ -8339,6 +8710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         buildStatusItem()
         WindowMemory.shared.refresh()
+        WallpaperButton.shared.refresh()
         SystemMonitor.shared.refresh()   // สร้างหลังไอคอน Deft เพื่อให้ไปอยู่ทางซ้ายของไอคอน
         AIUsage.shared.refresh()
         startWhenTrusted()
@@ -8668,6 +9040,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             tip: "Edge & corner snapping · Snap Layouts · Snap Assist · shared dividers · Win+arrows"))
         menu.addItem(toggle("Live Preview", .livePreview,
                             tip: "Real, moving window previews in the switcher (Cmd+Tab), Snap Assist and when hovering the Dock. Needs Screen Recording"))
+        menu.addItem(toggle("Browse Folder Photos", .photoBrowse,
+                            tip: "Double-click a photo and flip through every photo in its folder with the arrow keys, like Windows Photos. Deft becomes the app that opens images and hands them to Preview; turn off and each photo opens on its own in the app that opened it before. Also adds a Set as Wallpaper button to Preview's toolbar"))
 
         // ---- Keyboard ------------------------------------------------------
         menu.addItem(separator())
@@ -8731,7 +9105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ---- Battery -------------------------------------------------------
         // อุปกรณ์ที่ Deft เห็นตอนเปิดเมนู (เครื่องนี้ + ทุกตัวที่รายงานแบตให้ macOS) เปิด/ปิดช่องบนเมนูบาร์ได้ทีละตัว
-        // ตัวที่เคยเปิดไว้แต่ตอนนี้ไม่ได้ต่ออยู่ยังอยู่ในรายการ (จะได้ปิดได้) พอกลับมาต่อ ช่องก็กลับมาเอง
+        // ตัวที่ไม่ได้ต่ออยู่ไม่ขึ้นในรายการ แต่ค่าที่ตั้งไว้ยังจำอยู่ พอกลับมาต่อก็ขึ้นตามเดิมทั้งในเมนูและบนเมนูบาร์
         menu.addItem(separator())
         menu.addItem(header("Battery"))
         let detected = DeviceBatteries.read()
@@ -8747,19 +9121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SystemMonitor.shared.refresh()
             })
         }
-        for (id, name) in chosen.sorted(by: { $0.value < $1.value }) where !detected.contains(where: { $0.id == id }) {
-            menu.addItem(MenuToggleRow(title: name + "  (not connected)", isOn: true,
-                                       tip: "Its battery cell comes back when the device reconnects. Turn off to forget it",
-                                       indent: 24) { on in
-                guard !on else { return }
-                var next = Config.batteryDevices
-                next[id] = nil
-                Config.batteryDevices = next
-                SystemMonitor.shared.refresh()
-                DispatchQueue.main.async { [weak self] in self?.refreshMenu() }
-            })
-        }
-        if detected.isEmpty && chosen.isEmpty { menu.addItem(note("No device reports a battery right now")) }
+        if detected.isEmpty { menu.addItem(note("No device reports a battery right now")) }
 
         // ---- AI Usage ------------------------------------------------------
         menu.addItem(separator())

@@ -106,6 +106,28 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>CFBundleIconFile</key><string>$NAME</string>
     <key>NSHighResolutionCapable</key><true/>
+    <!-- Browse Folder Photos: Deft รับเปิดรูปแล้วส่งทั้งโฟลเดอร์ให้ Preview · Alternate = ไม่แย่งเป็นแอปหลักเอง
+         รายการชนิดต้องตรงกับ PhotoBrowse.typeIDs -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>Image</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.png</string>
+                <string>public.jpeg</string>
+                <string>public.heic</string>
+                <string>public.heif</string>
+                <string>com.compuserve.gif</string>
+                <string>public.tiff</string>
+                <string>com.microsoft.bmp</string>
+                <string>org.webmproject.webp</string>
+                <string>public.avif</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
