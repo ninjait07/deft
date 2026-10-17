@@ -16,8 +16,6 @@ Everything Deft does happens locally on your Mac. To provide its features, Deft 
 
 **Claude Code usage (optional):** when the AI Usage cell is on and the Claude Code command-line tool is installed, Deft asks that tool to run its own `/usage` command in the background — about every five minutes while you are using Claude Code, and when you open the monitor details. Claude Code then contacts Anthropic with its own sign-in, exactly as when you type `/usage` yourself, and saves the percentages on your Mac, where Deft reads them. Deft never sees your Claude sign-in, sends nothing itself, and the command uses none of your quota. Turn the AI Usage switch off to stop it.
 
-**Browse Folder Photos (optional, off by default):** when you turn it on, Deft becomes the app that opens common image files. When you open a photo, Deft lists the image files in that same folder and hands them to Preview; it never reads, copies, or uploads the photos themselves. While Preview is in front, Deft reads which photo is showing (through Accessibility) only to place its Set as Wallpaper button and to set that photo as your wallpaper when you click it.
-
 **Donations** are handled entirely by third parties (your bank via PromptPay, or GitHub Sponsors). Deft never sees or stores your payment details.
 
 ## ไทย
@@ -31,7 +29,5 @@ Everything Deft does happens locally on your Mac. To provide its features, Deft 
 - **Input Monitoring** — ใช้แยกว่าเป็นคีย์บอร์ด Windows หรือ Mac สำหรับ Auto Keyboard Detect เท่านั้น ไม่มีการบันทึกหรือส่งสิ่งที่พิมพ์
 
 **การใช้เครือข่าย:** Deft ต่อเน็ตเพียงอย่างเดียวคือเช็คเวอร์ชันใหม่ โดยอ่านไฟล์สาธารณะเล็ก ๆ (appcast.json) บน GitHub คำขอนี้ไม่มีข้อมูลส่วนตัว ไม่มีบัญชีผู้ใช้ ไม่มี analytics ไม่มีโฆษณา ไม่มีการติดตาม
-
-**Browse Folder Photos (เลือกเปิดเอง ปิดไว้ตั้งแต่ต้น):** เมื่อเปิด Deft จะเป็นแอปที่รับเปิดไฟล์รูปทั่วไป ตอนเปิดรูป Deft แค่ดูรายชื่อไฟล์รูปในโฟลเดอร์เดียวกันแล้วส่งให้ Preview ไม่อ่าน ไม่คัดลอก และไม่ส่งรูปออกไปไหน ระหว่างที่ Preview อยู่หน้าสุด Deft อ่านว่ากำลังโชว์รูปไหน (ผ่าน Accessibility) เพื่อวางปุ่ม Set as Wallpaper และตั้งรูปนั้นเป็นวอลเปเปอร์เมื่อคุณกดเท่านั้น
 
 **การบริจาค** จัดการโดยบุคคลที่สามทั้งหมด (ธนาคารผ่าน PromptPay หรือ GitHub Sponsors) Deft ไม่เห็นและไม่เก็บข้อมูลการชำระเงินของคุณ
